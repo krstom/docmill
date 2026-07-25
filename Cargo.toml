@@ -1,0 +1,57 @@
+[package]
+name = "docmill"
+description = "Document-to-Markdown converter with pluggable OCR over embedded pictures (DOCX/PDF/images) — built on docling.rs; not affiliated with the Docling project"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+# Standalone project: deliberately NOT a member of the docling.rs workspace —
+# it builds against the sibling checkout via path dependencies and keeps its
+# own lockfile, so the upstream repo stays untouched.
+[workspace]
+
+[[bin]]
+name = "docmill"
+path = "src/main.rs"
+
+[features]
+default = ["pdf", "asr", "fetch-images", "vlm", "local-ocr", "serve"]
+# The remote-VLM page pipeline (docling-rs --pipeline vlm).
+vlm = ["docling/vlm"]
+# --use-web-browser (Chromium HTML pre-render); off by default like docling.
+web-browser = ["docling/web-browser"]
+# `docmill serve`: a small local HTTP conversion service (tiny_http —
+# synchronous like the converter itself, no async runtime), meant to sit
+# behind an nginx proxy. See README "Web service".
+serve = ["dep:tiny_http"]
+# Passthroughs to the docling converter's own feature slices. Dropping `pdf`
+# (and `local-ocr`) gives a build with no onnxruntime link at all: DOCX/HTML/…
+# still convert, images OCR through remote engines — and `cargo test
+# --no-default-features` stays green on hosts whose glibc predates the
+# prebuilt static onnxruntime (see README).
+pdf = ["docling/pdf"]
+asr = ["docling/asr"]
+fetch-images = ["docling/fetch-images"]
+# Local PP-OCRv3 recognition (docling-pdf's public `ocr_prep` helpers + our own
+# onnxruntime session). On hosts whose glibc is too old for the auto-downloaded
+# static onnxruntime, link a system copy dynamically instead:
+# ORT_LIB_LOCATION=<dir with libonnxruntime.so> ORT_PREFER_DYNAMIC_LINK=1 cargo build
+local-ocr = ["dep:docling-pdf", "docling-pdf/ocr-prep", "dep:ort", "dep:image"]
+
+[dependencies]
+docling = { path = "../docling.rs/crates/docling", default-features = false }
+docling-core = { path = "../docling.rs/crates/docling-core" }
+docling-pdf = { path = "../docling.rs/crates/docling-pdf", default-features = false, optional = true }
+# Versions pinned to what the docling.rs workspace already uses, so the shared
+# dependency graph resolves to one copy of each.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "webp"], optional = true }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "tls-rustls"], optional = true }
+serde_json = "1"
+sha2 = "0.10"
+tiny_http = { version = "0.12", optional = true }
+ureq = "3"
+
+[dev-dependencies]
+tempfile = "3"

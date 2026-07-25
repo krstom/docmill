@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: docmill
+      # Path dependency: the docling.rs checkout must sit beside this one.
+      - uses: actions/checkout@v4
+        with:
+          repository: docling-project/docling.rs
+          path: docling.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: docmill
+      # No default features: skips the onnxruntime link entirely, so the unit
+      # suite (cache, post-processor, parsers, layout, config) runs without
+      # model downloads. The full-feature build is exercised by install.sh on
+      # real hosts and by the platform checks below.
+      - name: Test (no default features)
+        working-directory: docmill
+        run: cargo test --no-default-features
+      - name: Check (default features compile)
+        working-directory: docmill
+        run: cargo check --all-targets
+
+  platform-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: docmill
+      - uses: actions/checkout@v4
+        with:
+          repository: docling-project/docling.rs
+          path: docling.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: docmill
+      - name: Test (no default features)
+        working-directory: docmill
+        run: cargo test --no-default-features
+      - name: Check (default features compile)
+        working-directory: docmill
+        run: cargo check --all-targets
