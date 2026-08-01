@@ -1,7 +1,7 @@
 [package]
 name = "docmill"
 description = "Document-to-Markdown converter with pluggable OCR over embedded pictures (DOCX/PDF/images) — built on docling.rs; not affiliated with the Docling project"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

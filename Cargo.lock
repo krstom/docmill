@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "docmill"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "docling",
  "docling-core",
