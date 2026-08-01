@@ -15,7 +15,8 @@
 //!                   the raw request body with `?filename=doc.docx`.
 //!                   Query/form options (all optional): `to=md|json`,
 //!                   `mode=fence|markers|text|quote|placeholder`,
-//!                   `pages=A-B`, `strict=1`. The OCR engine chain is fixed
+//!                   `pages=A-B`, `strict=1`, `force_full_page_ocr=1`,
+//!                   `no_text_panels=1`. The OCR engine chain is fixed
 //!                   at server start (sessions stay warm); per-request
 //!                   engine switching is deliberately not offered.
 
@@ -154,6 +155,14 @@ fn convert(
         return Err((400, format!("to={to:?} is not md|json")));
     }
     let strict = matches!(opts.get("strict").map(String::as_str), Some("1" | "true"));
+    let force_full_page_ocr = matches!(
+        opts.get("force_full_page_ocr").map(String::as_str),
+        Some("1" | "true")
+    );
+    let no_text_panels = matches!(
+        opts.get("no_text_panels").map(String::as_str),
+        Some("1" | "true")
+    );
     let mode = match opts.get("mode").map(String::as_str) {
         None => state.cfg.mode,
         Some("fence") => OutputMode::Fence,
@@ -173,7 +182,10 @@ fn convert(
         one_picture_document(&filename, bytes, strict)
     } else {
         let source = SourceDocument::from_bytes(filename.clone(), format, bytes);
-        let mut converter = DocumentConverter::new().strict(strict);
+        let mut converter = DocumentConverter::new()
+            .strict(strict)
+            .force_full_page_ocr(force_full_page_ocr)
+            .no_text_panels(no_text_panels);
         if let Some((first, last)) = pages {
             converter = converter.page_range(first, last);
         }

@@ -136,8 +136,16 @@ multilingual.
 Conversion flags carried over from `docling-rs` (same semantics, buffered
 path): `--to md|json|dclx`, `-o/--output FILE`, `--strict`, `--pages A-B`,
 `--images placeholder|embedded|referenced`, `--fetch-images`,
-`--no-table-former`, `--no-ocr`, `--ocr-lang en|ch` (the PDF pipeline's own
-page OCR — independent of picture OCR), `--enrich-*`.
+`--no-table-former`, `--no-ocr`, `--force-full-page-ocr` (OCR every PDF page
+even when it has a text layer), `--no-text-panels` (keep every detected
+picture as a picture instead of demoting text panels to paragraphs),
+`--ocr-lang en|ch` (the PDF pipeline's own page OCR — independent of picture
+OCR), `--enrich-*`.
+
+Tracking docling.rs: as of v0.52.x the upstream pipeline also brings, with no
+flags needed, scanned-table extraction (OCR feeds TableFormer's cell matcher),
+an fp32 layout retry for pages the int8 model misreads, xref repair for broken
+PDFs, and JSON exports carrying page geometry and per-item provenance.
 
 ## Format specifics
 

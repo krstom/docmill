@@ -14,6 +14,9 @@
 //!   --no-table-former   skip the TableFormer model for PDF/image input
 //!   --no-ocr            skip the whole ML stack for PDF input (text layer
 //!                       only — produces no picture crops, so nothing to OCR)
+//!   --force-full-page-ocr  OCR every PDF page even when it has a text layer
+//!   --no-text-panels    keep every detected picture as a picture (disable
+//!                       the text-panel-to-paragraphs demotion)
 //!   --ocr-lang en|ch    the PDF pipeline's own page-OCR language
 //!   --enrich-picture-classes / --enrich-code / --enrich-formula
 //!
@@ -81,6 +84,10 @@ Conversion (same semantics as docling-rs):
   --no-table-former           skip the TableFormer model for PDF/image input
   --no-ocr                    PDF text-layer only (no ML; produces no picture
                               crops, so nothing to picture-OCR)
+  --force-full-page-ocr       OCR every PDF page even when it has a text layer
+                              (for text layers that lie)
+  --no-text-panels            keep every detected picture as a picture —
+                              disable the text-panel-to-paragraphs demotion
   --ocr-lang en|ch            the PDF pipeline's own page-OCR language
   --asr-model PRESET          Whisper preset for audio inputs
   --video-frames N            max frames sampled from a video input
@@ -143,6 +150,8 @@ fn main() -> ExitCode {
     let mut no_stream = false;
     let mut no_table_former = false;
     let mut no_ocr = false;
+    let mut force_full_page_ocr = false;
+    let mut no_text_panels = false;
     let mut use_web_browser = false;
     let mut asr_model: Option<String> = None;
     let mut video_frames: Option<usize> = None;
@@ -174,6 +183,8 @@ fn main() -> ExitCode {
             "--no-stream" => no_stream = true,
             "--no-table-former" => no_table_former = true,
             "--no-ocr" => no_ocr = true,
+            "--force-full-page-ocr" => force_full_page_ocr = true,
+            "--no-text-panels" => no_text_panels = true,
             "--use-web-browser" => use_web_browser = true,
             "--enrich-picture-classes" => enrich_picture_classes = true,
             "--enrich-code" => enrich_code = true,
@@ -284,6 +295,8 @@ fn main() -> ExitCode {
             .fetch_images(fetch_images)
             .no_table_former(no_table_former)
             .no_ocr(no_ocr)
+            .force_full_page_ocr(force_full_page_ocr)
+            .no_text_panels(no_text_panels)
             .use_web_browser(use_web_browser)
             .do_picture_classification(enrich_picture_classes)
             .do_code_enrichment(enrich_code)
