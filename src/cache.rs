@@ -128,15 +128,25 @@ impl OcrCache {
         // Atomic-enough replace: temp file in the same directory + rename, so
         // readers only ever see complete entries. Windows' rename refuses to
         // overwrite, hence the remove-and-retry fallback.
-        let tmp = path.with_extension("json.tmp");
+        // A batch worker may populate the same cache entry concurrently with
+        // another worker. Give every writer its own temporary file so one
+        // rename cannot steal another writer's in-progress data.
+        static NEXT_TMP: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), serial));
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(body.as_bytes())?;
         }
-        std::fs::rename(&tmp, path).or_else(|_| {
+        let result = std::fs::rename(&tmp, path).or_else(|_| {
             let _ = std::fs::remove_file(path);
             std::fs::rename(&tmp, path)
-        })
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 }
 
@@ -227,5 +237,38 @@ mod tests {
             },
         );
         assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn concurrent_writes_leave_one_valid_entry_and_no_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(OcrCache::new(dir.path().to_path_buf()));
+        let key = OcrCache::key("ppocr", "parallel", b"same-image");
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let cache = cache.clone();
+                let key = key.clone();
+                scope.spawn(move || {
+                    cache.put(
+                        &key,
+                        &CachedOcr {
+                            text: format!("worker-{i}"),
+                            grid: None,
+                            engine: "ppocr".into(),
+                            created: i,
+                        },
+                    );
+                });
+            }
+        });
+        let hit = cache.get(&key).expect("one complete entry remains");
+        assert!(hit.text.starts_with("worker-"));
+        let shard = dir.path().join(&key[..2]);
+        let leftovers: Vec<_> = std::fs::read_dir(shard)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary cache files: {leftovers:?}");
     }
 }

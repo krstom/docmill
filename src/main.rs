@@ -2,11 +2,13 @@
 //! pictures (DOCX drawings, PDF figure regions, standalone images).
 //!
 //! Usage: docmill [conversion flags] [--img-ocr-* flags] <input-file>
+//!        docmill --input GLOB|DIR --output DIR [--jobs N] [flags]
 //!
 //! Conversion flags (same semantics as `docling-rs`, buffered path):
 //!   --to md|json|dclx   output format (default: md)
-//!   --output FILE, -o   write output to FILE instead of stdout (dclx always
-//!                       writes a file; this overrides its default name)
+//!   --output PATH, -o   single input: write to FILE; batch: output DIR
+//!   --input GLOB|DIR    batch-convert matching/supported files
+//!   --jobs N            batch workers (default: 1)
 //!   --strict            cleaner Markdown instead of docling-legacy output
 //!   --pages A-B         PDF page window (1-based, inclusive)
 //!   --images MODE       placeholder (default) | embedded | referenced
@@ -67,6 +69,7 @@ const USAGE: &str = "\
 docmill — document conversion (docling.rs) + OCR over embedded pictures
 
 usage: docmill [OPTIONS] <input-file>
+       docmill --input GLOB|DIR --output DIR [--jobs N] [OPTIONS]
 
 Subcommands:
   serve [--addr HOST:PORT] [--img-ocr-* flags]
@@ -76,7 +79,9 @@ Subcommands:
 
 Conversion (same semantics as docling-rs):
   --to md|json|dclx|chunks    output format (default: md)
-  -o, --output FILE           write output to FILE instead of stdout
+  --input GLOB|DIR            batch-convert a glob or supported files under DIR
+  -o, --output PATH           single input: output FILE; batch: required DIR
+  --jobs N                    batch workers (default: 1; requires --input)
   --strict                    cleaner Markdown instead of docling-legacy output
   --pages A-B                 PDF page window (1-based, inclusive)
   --images MODE               placeholder (default) | embedded | referenced
@@ -171,6 +176,9 @@ fn main() -> ExitCode {
     let mut vlm_model: Option<String> = None;
     let mut cli = CliOverrides::default();
     let mut path: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut jobs = 1usize;
+    let mut jobs_set = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -195,7 +203,21 @@ fn main() -> ExitCode {
             "--enrich-code" => enrich_code = true,
             "--enrich-formula" => enrich_formula = true,
             "--to" => to = args.next().unwrap_or_default(),
-            "-o" | "--output" => output = args.next(),
+            "--input" => match args.next() {
+                Some(v) => input = Some(v),
+                None => return usage_error("--input needs a glob pattern or directory"),
+            },
+            "-o" | "--output" => match args.next() {
+                Some(v) => output = Some(v),
+                None => return usage_error("--output needs a path"),
+            },
+            "--jobs" => {
+                jobs_set = true;
+                jobs = match args.next().and_then(|v| v.parse().ok()) {
+                    Some(n) if n >= 1 => n,
+                    _ => return usage_error("--jobs needs a positive integer"),
+                };
+            }
             "--asr-model" => asr_model = args.next(),
             "--asr-lang" => asr_lang = args.next(),
             "--video-frames" => video_frames = args.next().and_then(|v| v.parse().ok()),
@@ -257,6 +279,69 @@ fn main() -> ExitCode {
             ))
         }
     };
+
+    if let Some(pattern) = input {
+        if path.is_some() {
+            return usage_error("--input and a positional input file are mutually exclusive");
+        }
+        if bench_warm.is_some() {
+            return usage_error("--bench-warm is a single-file mode; drop --input");
+        }
+        let Some(outdir) = output else {
+            return usage_error("--input needs --output DIR for the converted files");
+        };
+        let (files, base) = match expand_glob(&pattern) {
+            Ok(found) => found,
+            Err(e) => return usage_error(&e),
+        };
+        let cfg = match ImgOcrConfig::resolve(cli) {
+            Ok(cfg) => cfg,
+            Err(e) => return usage_error(&e),
+        };
+        #[cfg(feature = "vlm")]
+        let vlm = if pipeline.as_deref() == Some("vlm") {
+            let mut opts = match docling::vlm::VlmOptions::resolve(vlm_endpoint, vlm_model) {
+                Ok(opts) => opts,
+                Err(e) => return usage_error(&e.to_string()),
+            };
+            opts.page_range = pages;
+            Some(opts)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "vlm"))]
+        if pipeline.as_deref() == Some("vlm") {
+            return usage_error(
+                "this binary was built without the vlm feature (rebuild with --features vlm)",
+            );
+        }
+        let batch = BatchCfg {
+            to,
+            image_mode,
+            strict,
+            fetch_images,
+            no_table_former,
+            no_ocr,
+            force_full_page_ocr,
+            no_text_panels,
+            use_web_browser,
+            enrich_picture_classes,
+            enrich_code,
+            enrich_formula,
+            asr_model,
+            asr_lang,
+            video_frames,
+            pages,
+            ocr_lang,
+            picture_ocr: cfg,
+            #[cfg(feature = "vlm")]
+            vlm,
+        };
+        return run_batch(files, &base, Path::new(&outdir), jobs, &batch);
+    }
+    if jobs_set {
+        return usage_error("--jobs requires --input GLOB|DIR");
+    }
     let Some(path) = path else {
         eprint!("{USAGE}");
         return ExitCode::from(2);
@@ -561,6 +646,431 @@ fn chunks_json(document: &DoclingDocument) -> String {
     )
 }
 
+/// Conversion and picture-OCR settings frozen for every file in a batch.
+struct BatchCfg {
+    to: String,
+    image_mode: ImageMode,
+    strict: bool,
+    fetch_images: bool,
+    no_table_former: bool,
+    no_ocr: bool,
+    force_full_page_ocr: bool,
+    no_text_panels: bool,
+    use_web_browser: bool,
+    enrich_picture_classes: bool,
+    enrich_code: bool,
+    enrich_formula: bool,
+    asr_model: Option<String>,
+    asr_lang: Option<String>,
+    video_frames: Option<usize>,
+    pages: Option<(usize, usize)>,
+    ocr_lang: Option<String>,
+    picture_ocr: ImgOcrConfig,
+    #[cfg(feature = "vlm")]
+    vlm: Option<docling::vlm::VlmOptions>,
+}
+
+/// Expand a glob or recursively sweep a directory, returning the files and
+/// the static base path used to preserve their relative output layout.
+fn expand_glob(
+    pattern: &str,
+) -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), String> {
+    let dir = Path::new(pattern);
+    if dir.is_dir() {
+        let mut files = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let entries = std::fs::read_dir(&current)
+                .map_err(|e| format!("--input '{}': {e}", current.display()))?;
+            for entry in entries {
+                let path = entry.map_err(|e| format!("--input: {e}"))?.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| InputFormat::from_extension(ext).is_some())
+                {
+                    files.push(path);
+                }
+            }
+        }
+        if files.is_empty() {
+            return Err(format!(
+                "--input '{pattern}' contains no files with a convertible extension"
+            ));
+        }
+        files.sort();
+        return Ok((files, dir.to_path_buf()));
+    }
+
+    let base = glob_base(pattern);
+    let mut files = Vec::new();
+    for entry in glob::glob(pattern).map_err(|e| format!("--input: {e}"))? {
+        match entry {
+            Ok(path) if path.is_file() => files.push(path),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: {e}"),
+        }
+    }
+    if files.is_empty() {
+        return Err(format!("--input '{pattern}' matches no files"));
+    }
+    files.sort();
+    Ok((files, base))
+}
+
+fn glob_base(pattern: &str) -> std::path::PathBuf {
+    let mut base = std::path::PathBuf::new();
+    for component in Path::new(pattern).components() {
+        let text = component.as_os_str().to_string_lossy();
+        if text.contains(['*', '?', '[']) {
+            break;
+        }
+        base.push(component);
+    }
+    if base == Path::new(pattern) {
+        base.pop();
+    }
+    base
+}
+
+fn batch_out_path(
+    file: &Path,
+    base: &Path,
+    output: &Path,
+    to: &str,
+) -> std::path::PathBuf {
+    let relative = file
+        .strip_prefix(base)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| Path::new(file.file_name().unwrap_or_default()).to_path_buf());
+    let extension = match to {
+        "json" => "json",
+        "dclx" => "dclx",
+        "chunks" => "chunks.json",
+        _ => "md",
+    };
+    output.join(relative).with_extension(extension)
+}
+
+fn batch_converter(cfg: &BatchCfg) -> DocumentConverter {
+    let mut converter = DocumentConverter::new()
+        .strict(cfg.strict)
+        .asr_model(cfg.asr_model.clone())
+        .asr_lang(cfg.asr_lang.clone())
+        .fetch_images(cfg.fetch_images)
+        .no_table_former(cfg.no_table_former)
+        .no_ocr(cfg.no_ocr)
+        .force_full_page_ocr(cfg.force_full_page_ocr)
+        .no_text_panels(cfg.no_text_panels)
+        .use_web_browser(cfg.use_web_browser)
+        .do_picture_classification(cfg.enrich_picture_classes)
+        .do_code_enrichment(cfg.enrich_code)
+        .do_formula_enrichment(cfg.enrich_formula);
+    if let Some(max) = cfg.video_frames {
+        converter = converter.video_frames(max);
+    }
+    if let Some((first, last)) = cfg.pages {
+        converter = converter.page_range(first, last);
+    }
+    if let Some(lang) = &cfg.ocr_lang {
+        converter = converter.ocr_lang(lang.clone());
+    }
+    converter
+}
+
+#[cfg(feature = "pdf")]
+type SharedBatchPipeline = std::sync::Mutex<Option<docling::Pipeline>>;
+
+#[cfg(not(feature = "pdf"))]
+struct SharedBatchPipeline;
+
+#[cfg(feature = "pdf")]
+fn batch_pipeline<'a>(
+    slot: &'a mut Option<docling::Pipeline>,
+    cfg: &BatchCfg,
+) -> Result<&'a mut docling::Pipeline, String> {
+    if slot.is_none() {
+        let mut pipeline = docling::Pipeline::new()
+            .map_err(|e| e.to_string())?
+            .no_table_former(cfg.no_table_former)
+            .no_ocr(cfg.no_ocr)
+            .force_full_page_ocr(cfg.force_full_page_ocr)
+            .no_text_panels(cfg.no_text_panels)
+            .enrichments(docling::EnrichmentOptions {
+                picture_classification: cfg.enrich_picture_classes,
+                code: cfg.enrich_code,
+                formula: cfg.enrich_formula,
+            });
+        pipeline.set_pages(cfg.pages);
+        pipeline.set_ocr_lang(match cfg.ocr_lang.as_deref() {
+            Some("ch") => Some(docling::OcrLang::Ch),
+            Some(_) => Some(docling::OcrLang::En),
+            None => None,
+        });
+        *slot = Some(pipeline);
+    }
+    Ok(slot.as_mut().expect("pipeline initialized"))
+}
+
+fn batch_convert_one(
+    file: &Path,
+    base: &Path,
+    output: &Path,
+    cfg: &BatchCfg,
+    converter: &DocumentConverter,
+    runner: &mut Option<docmill::engine::OcrRunner>,
+    shared_pipeline: &SharedBatchPipeline,
+) -> Result<(std::path::PathBuf, f64, Option<usize>), String> {
+    let source = DetectedSource::from_path(file).map_err(|e| e.to_string())?;
+    if let Some(warning) = &source.warning {
+        eprintln!("warning: {}: {warning}", file.display());
+    }
+    let page_count = batch_page_count(&source, cfg.pages);
+    match page_count {
+        Some(1) => eprintln!("start: {} (1 page)", file.display()),
+        Some(n) => eprintln!("start: {} ({n} pages)", file.display()),
+        None => eprintln!("start: {}", file.display()),
+    }
+
+    let started = std::time::Instant::now();
+    let format = source.format;
+    let mut document = if !batch_uses_vlm(cfg)
+        && cfg.picture_ocr.mode != OutputMode::Placeholder
+        && cfg.picture_ocr.remote_first()
+        && format == InputFormat::Image
+    {
+        one_picture_document(&source.name, source.bytes, cfg.strict)
+    } else {
+        batch_convert_source(source, converter, cfg, shared_pipeline)?
+    };
+    document.strict_markdown = cfg.strict;
+
+    if let Some(runner) = runner {
+        let options = PostOptions {
+            mode: cfg.picture_ocr.mode,
+            min_pixels: cfg.picture_ocr.min_pixels,
+            keep_picture: cfg.image_mode != ImageMode::Placeholder,
+            ocr_hidden: cfg.to == "dclx",
+        };
+        let stats = postprocess::apply(&mut document, runner, &options);
+        eprintln!("{}: {stats}", file.display());
+    }
+
+    let out = batch_out_path(file, base, output, &cfg.to);
+    write_batch_document(document, cfg, &out)?;
+    Ok((out, started.elapsed().as_secs_f64(), page_count))
+}
+
+fn batch_uses_vlm(cfg: &BatchCfg) -> bool {
+    #[cfg(feature = "vlm")]
+    {
+        cfg.vlm.is_some()
+    }
+    #[cfg(not(feature = "vlm"))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
+fn batch_page_count(source: &DetectedSource, pages: Option<(usize, usize)>) -> Option<usize> {
+    #[cfg(feature = "pdf")]
+    {
+        if source.format == InputFormat::Pdf {
+            return docling::pdf_page_count(&source.bytes, None).ok().map(|total| match pages {
+                Some((first, last)) => (last.min(total) + 1).saturating_sub(first).min(total),
+                None => total,
+            });
+        }
+    }
+    #[cfg(not(feature = "pdf"))]
+    let _ = (source, pages);
+    None
+}
+
+fn batch_convert_source(
+    source: DetectedSource,
+    converter: &DocumentConverter,
+    cfg: &BatchCfg,
+    shared_pipeline: &SharedBatchPipeline,
+) -> Result<DoclingDocument, String> {
+    #[cfg(not(any(feature = "pdf", feature = "vlm")))]
+    let _ = cfg;
+    #[cfg(feature = "vlm")]
+    if let Some(vlm) = &cfg.vlm {
+        return docling::vlm::convert_vlm(&source.into_docling(), vlm)
+            .map_err(|e| e.to_string());
+    }
+
+    #[cfg(feature = "pdf")]
+    if matches!(source.format, InputFormat::Pdf | InputFormat::Image) {
+        let mut guard = shared_pipeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pipeline = batch_pipeline(&mut guard, cfg)?;
+        return match source.format {
+            InputFormat::Pdf => pipeline.convert(&source.bytes, None, &source.name),
+            _ => pipeline.convert_image(&source.bytes, &source.name),
+        }
+        .map_err(|e| e.to_string());
+    }
+
+    #[cfg(not(feature = "pdf"))]
+    let _ = shared_pipeline;
+    converter
+        .convert(source.into_docling())
+        .map(|result| result.document)
+        .map_err(|e| e.to_string())
+}
+
+fn write_batch_document(
+    document: DoclingDocument,
+    cfg: &BatchCfg,
+    out: &Path,
+) -> Result<(), String> {
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    match cfg.to.as_str() {
+        "json" => std::fs::write(out, document.export_to_json())
+            .map_err(|e| format!("writing {}: {e}", out.display())),
+        "chunks" => std::fs::write(out, chunks_json(&document))
+            .map_err(|e| format!("writing {}: {e}", out.display())),
+        "dclx" => docling::dclx::save_as_dclx(&document, out).map_err(|e| e.to_string()),
+        _ if cfg.image_mode == ImageMode::Placeholder => {
+            std::fs::write(out, document.export_to_markdown())
+                .map_err(|e| format!("writing {}: {e}", out.display()))
+        }
+        _ => {
+            let stem = out
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "document".into());
+            let artifact_dir = format!("{stem}_artifacts");
+            let (markdown, artifacts) =
+                document.export_to_markdown_with_images(cfg.image_mode, &artifact_dir);
+            let parent = out.parent().unwrap_or(Path::new(""));
+            for (relative, bytes) in artifacts {
+                let target = parent.join(relative);
+                if let Some(dir) = target.parent() {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+                }
+                std::fs::write(&target, bytes)
+                    .map_err(|e| format!("writing {}: {e}", target.display()))?;
+            }
+            std::fs::write(out, markdown)
+                .map_err(|e| format!("writing {}: {e}", out.display()))
+        }
+    }
+}
+
+fn run_batch(
+    files: Vec<std::path::PathBuf>,
+    base: &Path,
+    output: &Path,
+    jobs: usize,
+    cfg: &BatchCfg,
+) -> ExitCode {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let run_picture_ocr = cfg.picture_ocr.mode != OutputMode::Placeholder;
+    if run_picture_ocr {
+        if let Err(e) = cfg.picture_ocr.build_runner() {
+            return usage_error(&e);
+        }
+    }
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let succeeded = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+    #[cfg(feature = "pdf")]
+    let shared_pipeline = std::sync::Mutex::new(None);
+    #[cfg(not(feature = "pdf"))]
+    let shared_pipeline = SharedBatchPipeline;
+    let workers = jobs.min(files.len()).max(1);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let converter = batch_converter(cfg);
+                let mut runner = run_picture_ocr
+                    .then(|| cfg.picture_ocr.build_runner().expect("runner prevalidated"));
+                loop {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(index) else {
+                        break;
+                    };
+                    match batch_convert_one(
+                        file,
+                        base,
+                        output,
+                        cfg,
+                        &converter,
+                        &mut runner,
+                        &shared_pipeline,
+                    ) {
+                        Ok((out, seconds, pages)) => {
+                            match pages {
+                                Some(n) if n > 0 => eprintln!(
+                                    "ok: {} -> {} ({seconds:.1}s, {:.0} ms/page)",
+                                    file.display(),
+                                    out.display(),
+                                    seconds * 1000.0 / n as f64
+                                ),
+                                _ => eprintln!(
+                                    "ok: {} -> {} ({seconds:.1}s)",
+                                    file.display(),
+                                    out.display()
+                                ),
+                            }
+                            println!("{}", out.display());
+                            succeeded.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("error: {}: {error}", file.display());
+                            if global_batch_failure(&error) {
+                                abort.store(true, Ordering::Relaxed);
+                                eprintln!(
+                                    "fatal: shared conversion runtime is unavailable; aborting batch"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failed.load(Ordering::Relaxed);
+    let successes = succeeded.load(Ordering::Relaxed);
+    let skipped = files.len() - successes - failures;
+    if skipped > 0 {
+        eprintln!("batch: {successes} converted, {failures} failed, {skipped} skipped");
+    } else {
+        eprintln!("batch: {successes} converted, {failures} failed");
+    }
+    if failures > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn global_batch_failure(error: &str) -> bool {
+    error.contains("execution provider")
+        || error.contains("pdfium library is not installed")
+        || error.contains("model not found at")
+}
+
 /// `docmill serve …`: parse the serve flags and run the HTTP service.
 fn run_serve(args: Vec<String>) -> ExitCode {
     #[cfg(feature = "serve")]
@@ -687,4 +1197,57 @@ fn output_document(
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_base_is_the_static_prefix() {
+        assert_eq!(glob_base("reports/**/*.pdf"), Path::new("reports"));
+        assert_eq!(
+            glob_base("reports/one.pdf"),
+            Path::new("reports")
+        );
+    }
+
+    #[test]
+    fn batch_output_extensions_match_the_target() {
+        let file = Path::new("input/nested/report.pdf");
+        let base = Path::new("input");
+        let output = Path::new("converted");
+        assert_eq!(
+            batch_out_path(file, base, output, "md"),
+            Path::new("converted/nested/report.md")
+        );
+        assert_eq!(
+            batch_out_path(file, base, output, "json"),
+            Path::new("converted/nested/report.json")
+        );
+        assert_eq!(
+            batch_out_path(file, base, output, "dclx"),
+            Path::new("converted/nested/report.dclx")
+        );
+        assert_eq!(
+            batch_out_path(file, base, output, "chunks"),
+            Path::new("converted/nested/report.chunks.json")
+        );
+    }
+
+    #[test]
+    fn directory_batch_discovery_is_sorted_and_filters_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("z.md"), "z").unwrap();
+        std::fs::write(dir.path().join("nested/a.md"), "a").unwrap();
+        std::fs::write(dir.path().join("ignored.log"), "ignored").unwrap();
+
+        let (files, base) = expand_glob(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(base, dir.path());
+        assert_eq!(
+            files,
+            vec![dir.path().join("nested/a.md"), dir.path().join("z.md")]
+        );
+    }
 }

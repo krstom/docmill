@@ -37,6 +37,7 @@ following before using it:
 
 ```
 docmill [conversion flags] [--img-ocr-* flags] <input-file>
+docmill --input GLOB|DIR --output DIR [--jobs N] [conversion/img-ocr flags]
 ```
 
 `docmill --help` prints the full flag reference; `--version` the
@@ -136,13 +137,23 @@ for the v3 pair. `--img-ocr-lang` applies to v3 only — the v5 dictionary is
 multilingual.
 
 Conversion flags carried over from `docling-rs` (same semantics, buffered
-path): `--to md|json|dclx|chunks`, `-o/--output FILE`, `--strict`, `--pages A-B`,
+path): `--to md|json|dclx|chunks`, `-o/--output`, `--input GLOB|DIR`, `--jobs N`,
+`--strict`, `--pages A-B`,
 `--images placeholder|embedded|referenced`, `--fetch-images`,
 `--no-table-former`, `--no-ocr`, `--force-full-page-ocr` (OCR every PDF page
 even when it has a text layer), `--no-text-panels` (keep every detected
 picture as a picture instead of demoting text panels to paragraphs),
 `--ocr-lang en|ch` (the PDF pipeline's own page OCR — independent of picture
 OCR), `--asr-model`, `--asr-lang CODE|auto`, `--video-frames`, and `--enrich-*`.
+
+Batch mode recursively converts a directory or the files matched by a quoted
+glob, keeps their relative directory structure under `--output DIR`, and uses
+`.md`, `.json`, `.dclx`, or `.chunks.json` extensions according to `--to`.
+`--jobs N` runs independent conversion and picture-OCR workers while sharing
+one warm docling PDF/image pipeline. Failed files are reported and skipped;
+the remaining files continue, and the command exits non-zero if any failed.
+For a positional single input, `-o/--output` retains its existing meaning of
+an exact output filename.
 
 Tracking docling.rs: this release targets **v1.4.2**. It inherits upstream's
 RTF and XLSB backends, TSV/GIF/MPEG aliases, Visio and SVG, Apple iWork,
