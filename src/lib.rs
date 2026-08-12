@@ -21,6 +21,7 @@
 pub mod cache;
 pub mod config;
 pub mod engine;
+pub mod input;
 pub mod layout;
 pub mod postprocess;
 #[cfg(feature = "serve")]

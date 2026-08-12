@@ -28,6 +28,7 @@ use tiny_http::{Header, Method, Response, Server};
 
 use crate::config::ImgOcrConfig;
 use crate::engine::OcrRunner;
+use crate::input::{DetectedSource, InputError};
 use crate::postprocess::{self, one_picture_document, OutputMode, PostOptions};
 
 /// Uploads beyond this are rejected with 413 — a local conversion service
@@ -89,7 +90,11 @@ fn handle(mut request: tiny_http::Request, state: &State) {
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
 fn text(status: u16, body: &str) -> Resp {
-    with_type(status, body.as_bytes().to_vec(), "text/plain; charset=utf-8")
+    with_type(
+        status,
+        body.as_bytes().to_vec(),
+        "text/plain; charset=utf-8",
+    )
 }
 
 fn html(body: &str) -> Resp {
@@ -97,9 +102,11 @@ fn html(body: &str) -> Resp {
 }
 
 fn with_type(status: u16, body: Vec<u8>, ctype: &str) -> Resp {
-    Response::from_data(body).with_status_code(status).with_header(
-        Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).expect("static header"),
-    )
+    Response::from_data(body)
+        .with_status_code(status)
+        .with_header(
+            Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).expect("static header"),
+        )
 }
 
 fn convert(
@@ -143,12 +150,11 @@ fn convert(
         (filename, body)
     };
 
-    let ext = std::path::Path::new(&filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .ok_or((415, format!("no extension on {filename:?}")))?;
-    let format = InputFormat::from_extension(ext)
-        .ok_or((415, format!("unsupported file extension {ext:?}")))?;
+    let source = DetectedSource::from_bytes(filename.clone(), bytes)
+        .map_err(|error| (input_error_status(&error), error.to_string()))?;
+    if let Some(warning) = &source.warning {
+        eprintln!("convert {filename}: warning: {warning}");
+    }
 
     let to = opts.get("to").map(String::as_str).unwrap_or("md");
     if !matches!(to, "md" | "markdown" | "json") {
@@ -178,21 +184,24 @@ fn convert(
     };
 
     let run_ocr = mode != OutputMode::Placeholder;
-    let mut document = if run_ocr && state.cfg.remote_first() && format == InputFormat::Image {
-        one_picture_document(&filename, bytes, strict)
-    } else {
-        let source = SourceDocument::from_bytes(filename.clone(), format, bytes);
-        let mut converter = DocumentConverter::new()
-            .strict(strict)
-            .force_full_page_ocr(force_full_page_ocr)
-            .no_text_panels(no_text_panels);
-        if let Some((first, last)) = pages {
-            converter = converter.page_range(first, last);
+    let mut document = {
+        let format = source.format;
+        let source = SourceDocument::from_bytes(source.name, format, source.bytes);
+        if run_ocr && state.cfg.remote_first() && format == InputFormat::Image {
+            one_picture_document(&filename, source.bytes, strict)
+        } else {
+            let mut converter = DocumentConverter::new()
+                .strict(strict)
+                .force_full_page_ocr(force_full_page_ocr)
+                .no_text_panels(no_text_panels);
+            if let Some((first, last)) = pages {
+                converter = converter.page_range(first, last);
+            }
+            converter
+                .convert(source)
+                .map(|r| r.document)
+                .map_err(|e| (422, format!("convert {filename}: {e}")))?
         }
-        converter
-            .convert(source)
-            .map(|r| r.document)
-            .map_err(|e| (422, format!("convert {filename}: {e}")))?
     };
 
     if run_ocr {
@@ -210,7 +219,11 @@ fn convert(
     }
 
     Ok(if to == "json" {
-        with_type(200, document.export_to_json().into_bytes(), "application/json")
+        with_type(
+            200,
+            document.export_to_json().into_bytes(),
+            "application/json",
+        )
     } else {
         with_type(
             200,
@@ -220,9 +233,19 @@ fn convert(
     })
 }
 
+fn input_error_status(error: &InputError) -> u16 {
+    match error {
+        InputError::Unsupported { .. } => 415,
+        InputError::Io { .. } => 400,
+    }
+}
+
 /// Extract the boundary from a `multipart/form-data; boundary=…` header.
 fn multipart_boundary(content_type: &str) -> Option<String> {
-    if !content_type.to_ascii_lowercase().starts_with("multipart/form-data") {
+    if !content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/form-data")
+    {
         return None;
     }
     let b = content_type.split("boundary=").nth(1)?;
@@ -232,7 +255,10 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
 /// Minimal multipart/form-data parser: returns the first part carrying a
 /// `filename` (its name + bytes) and every simple text field. Enough for the
 /// HTML form and `curl -F`; not a general MIME implementation.
-fn parse_multipart(body: &[u8], boundary: &str) -> Option<(String, Vec<u8>, Vec<(String, String)>)> {
+fn parse_multipart(
+    body: &[u8],
+    boundary: &str,
+) -> Option<(String, Vec<u8>, Vec<(String, String)>)> {
     let delim = format!("--{boundary}");
     let mut file: Option<(String, Vec<u8>)> = None;
     let mut fields = Vec::new();
@@ -339,7 +365,7 @@ const FORM_HTML: &str = r#"<!doctype html>
 <style>body{font:15px system-ui;margin:3em auto;max-width:36em;padding:0 1em}
 label{display:block;margin:.8em 0 .2em}</style>
 <h1>docmill</h1>
-<p>Convert a document or picture to Markdown, OCRing embedded images.</p>
+<p>Convert a document or picture to Markdown, including OCR over embedded images.</p>
 <form method="post" action="convert" enctype="multipart/form-data">
   <label>File</label><input type="file" name="file" required>
   <label>Output</label>
@@ -354,7 +380,7 @@ label{display:block;margin:.8em 0 .2em}</style>
   </select>
   <label></label><button>Convert</button>
 </form>
-<p><small>POST /convert also accepts a raw body with ?filename=doc.docx;
+<p><small>POST /convert also accepts a raw body with ?filename=doc.docx (the extension may be omitted when content is recognizable);
 GET /health for liveness.</small></p>
 "#;
 

@@ -18,6 +18,8 @@
 //!   --no-text-panels    keep every detected picture as a picture (disable
 //!                       the text-panel-to-paragraphs demotion)
 //!   --ocr-lang en|ch    the PDF pipeline's own page-OCR language
+//!   --asr-model PRESET / --asr-lang CODE|auto
+//!                       Whisper preset and language for audio/video
 //!   --enrich-picture-classes / --enrich-code / --enrich-formula
 //!
 //! Picture-OCR flags (flag > DOCMILL_* env var > default):
@@ -40,8 +42,8 @@
 //!   --img-ocr-cache-dir DIR       OCR cache (default ~/.cache/docmill)
 //!   --no-img-ocr-cache            disable the cache for this run
 //!   --img-ocr-timeout SECS        remote request timeout (default 120)
-//!   --img-ocr-models-dir DIR      local models dir (default ./models; point it
-//!                                 at your docling.rs checkout's models/)
+//!   --img-ocr-models-dir DIR      local models dir (default ./.models; point it
+//!                                 at your docling.rs checkout's .models/)
 //!
 //! Standalone image inputs: with a local-first chain the image runs through
 //! docling's full ML pipeline (layout + OCR + tables) and embedded figure
@@ -56,6 +58,7 @@ use std::process::ExitCode;
 use docling::{DocumentConverter, ImageMode, InputFormat, SourceDocument};
 use docling_core::DoclingDocument;
 use docmill::config::{CliOverrides, ImgOcrConfig};
+use docmill::input::DetectedSource;
 use docmill::postprocess::{self, one_picture_document, OutputMode, PostOptions};
 
 /// The complete flag reference, printed by `--help` — kept as one constant so
@@ -90,6 +93,7 @@ Conversion (same semantics as docling-rs):
                               disable the text-panel-to-paragraphs demotion
   --ocr-lang en|ch            the PDF pipeline's own page-OCR language
   --asr-model PRESET          Whisper preset for audio inputs
+  --asr-lang CODE             Whisper language code or auto (default)
   --video-frames N            max frames sampled from a video input
   --use-web-browser           pre-render HTML in Chromium (web-browser feature)
   --pipeline standard|vlm     vlm = convert pages via a remote OpenAI-
@@ -122,7 +126,7 @@ Picture OCR (flag > DOCMILL_* env var > default):
   --img-ocr-cache-dir DIR     OCR result cache (default ~/.cache/docmill)
   --no-img-ocr-cache          disable the cache for this run
   --img-ocr-timeout SECS      remote request timeout (default 120)
-  --img-ocr-models-dir DIR    local models dir (default: ./models, else next to
+  --img-ocr-models-dir DIR    local models dir (default: ./.models, else next to
                               the installed binary)
 
   -h, --help                  print this help
@@ -154,6 +158,7 @@ fn main() -> ExitCode {
     let mut no_text_panels = false;
     let mut use_web_browser = false;
     let mut asr_model: Option<String> = None;
+    let mut asr_lang: Option<String> = None;
     let mut video_frames: Option<usize> = None;
     let mut enrich_picture_classes = false;
     let mut enrich_code = false;
@@ -192,6 +197,7 @@ fn main() -> ExitCode {
             "--to" => to = args.next().unwrap_or_default(),
             "-o" | "--output" => output = args.next(),
             "--asr-model" => asr_model = args.next(),
+            "--asr-lang" => asr_lang = args.next(),
             "--video-frames" => video_frames = args.next().and_then(|v| v.parse().ok()),
             "--images" => images = args.next().unwrap_or_default(),
             "--pipeline" => match args.next() {
@@ -237,7 +243,9 @@ fn main() -> ExitCode {
     }
 
     if !matches!(to.as_str(), "md" | "markdown" | "json" | "dclx" | "chunks") {
-        return usage_error(&format!("unknown --to '{to}' (expected: md, json, dclx, chunks)"));
+        return usage_error(&format!(
+            "unknown --to '{to}' (expected: md, json, dclx, chunks)"
+        ));
     }
     let image_mode = match images.as_str() {
         "placeholder" => ImageMode::Placeholder,
@@ -259,15 +267,19 @@ fn main() -> ExitCode {
         Err(e) => return usage_error(&e),
     };
 
-    let source = match SourceDocument::from_file(&path) {
+    let source = match DetectedSource::from_path(&path) {
         Ok(src) => src,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
+    if let Some(warning) = &source.warning {
+        eprintln!("warning: {warning}");
+    }
 
     if let Some(runs) = bench_warm {
+        let source = SourceDocument::from_bytes(source.name, source.format, source.bytes);
         return bench_warm_conversion(&source, runs, no_table_former, no_ocr);
     }
 
@@ -277,59 +289,72 @@ fn main() -> ExitCode {
     // stack is replaced; picture OCR still post-processes the result (VLM
     // pictures carry no bytes, so it is a no-op unless a backend adds them).
     if pipeline.as_deref() == Some("vlm") {
+        let format = source.format;
+        if !matches!(format, InputFormat::Pdf | InputFormat::Image) {
+            return usage_error("--pipeline vlm supports docling PDF/image inputs only");
+        }
+        let source = SourceDocument::from_bytes(source.name, format, source.bytes);
         return run_vlm_pipeline(
-            &source, vlm_endpoint, vlm_model, pages, strict, &cfg, run_ocr, &to, image_mode,
-            &path, output.as_deref(),
+            &source,
+            vlm_endpoint,
+            vlm_model,
+            pages,
+            strict,
+            &cfg,
+            run_ocr,
+            &to,
+            image_mode,
+            &path,
+            output.as_deref(),
         );
     }
 
-    // Standalone image + remote-first chain: skip the ML pipeline, build a
-    // one-picture document and let the post-processor do all the work.
-    let bypass = run_ocr && cfg.remote_first() && source.format == InputFormat::Image;
-    let mut document = if bypass {
-        one_picture_document(&source.name, source.bytes, strict)
-    } else {
-        let mut converter = DocumentConverter::new()
-            .strict(strict)
-            .asr_model(asr_model.clone())
-            .fetch_images(fetch_images)
-            .no_table_former(no_table_former)
-            .no_ocr(no_ocr)
-            .force_full_page_ocr(force_full_page_ocr)
-            .no_text_panels(no_text_panels)
-            .use_web_browser(use_web_browser)
-            .do_picture_classification(enrich_picture_classes)
-            .do_code_enrichment(enrich_code)
-            .do_formula_enrichment(enrich_formula);
-        if let Some(max) = video_frames {
-            converter = converter.video_frames(max);
-        }
-        if let Some((first, last)) = pages {
-            converter = converter.page_range(first, last);
-        }
-        if let Some(lang) = &ocr_lang {
-            converter = converter.ocr_lang(lang.clone());
-        }
-        // docling-rs parity: Markdown streams page by page by default. That
-        // only composes with picture OCR disabled (post-processing needs the
-        // full tree), so the streaming path is placeholder-mode-only. Without
-        // the pdf feature docling has no streaming API at all; the buffered
-        // path below produces byte-identical Markdown, just less
-        // incrementally.
-        #[cfg(feature = "pdf")]
-        {
-            let is_markdown = matches!(to.as_str(), "md" | "markdown");
-            if !run_ocr && is_markdown && !no_stream && output.is_none() {
-                return stream_markdown(converter, source, image_mode);
+    let mut document = {
+        let format = source.format;
+        let source = SourceDocument::from_bytes(source.name, format, source.bytes);
+        // Standalone image + remote-first chain: skip the ML pipeline,
+        // build one Picture and let the post-processor do the work.
+        let bypass = run_ocr && cfg.remote_first() && format == InputFormat::Image;
+        if bypass {
+            one_picture_document(&source.name, source.bytes, strict)
+        } else {
+            let mut converter = DocumentConverter::new()
+                .strict(strict)
+                .asr_model(asr_model.clone())
+                .asr_lang(asr_lang.clone())
+                .fetch_images(fetch_images)
+                .no_table_former(no_table_former)
+                .no_ocr(no_ocr)
+                .force_full_page_ocr(force_full_page_ocr)
+                .no_text_panels(no_text_panels)
+                .use_web_browser(use_web_browser)
+                .do_picture_classification(enrich_picture_classes)
+                .do_code_enrichment(enrich_code)
+                .do_formula_enrichment(enrich_formula);
+            if let Some(max) = video_frames {
+                converter = converter.video_frames(max);
             }
-        }
-        #[cfg(not(feature = "pdf"))]
-        let _ = no_stream;
-        match converter.convert(source) {
-            Ok(result) => result.document,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
+            if let Some((first, last)) = pages {
+                converter = converter.page_range(first, last);
+            }
+            if let Some(lang) = &ocr_lang {
+                converter = converter.ocr_lang(lang.clone());
+            }
+            #[cfg(feature = "pdf")]
+            {
+                let is_markdown = matches!(to.as_str(), "md" | "markdown");
+                if !run_ocr && is_markdown && !no_stream && output.is_none() {
+                    return stream_markdown(converter, source, image_mode);
+                }
+            }
+            #[cfg(not(feature = "pdf"))]
+            let _ = no_stream;
+            match converter.convert(source) {
+                Ok(result) => result.document,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     };
@@ -450,7 +475,19 @@ fn run_vlm_pipeline(
     }
     #[cfg(not(feature = "vlm"))]
     {
-        let _ = (source, vlm_endpoint, vlm_model, pages, strict, cfg, run_ocr, to, image_mode, path, output);
+        let _ = (
+            source,
+            vlm_endpoint,
+            vlm_model,
+            pages,
+            strict,
+            cfg,
+            run_ocr,
+            to,
+            image_mode,
+            path,
+            output,
+        );
         usage_error("this binary was built without the vlm feature (rebuild with --features vlm)")
     }
 }
@@ -480,7 +517,9 @@ fn bench_warm_conversion(
                         .convert_image(&source.bytes, &source.name)
                         .map(|_| ())
                         .map_err(|e| e.to_string()),
-                    other => Err(format!("--bench-warm supports PDF/image only, not {other:?}")),
+                    other => Err(format!(
+                        "--bench-warm supports PDF/image only, not {other:?}"
+                    )),
                 }
             };
             once(&mut pipeline)?; // warm-up: load models, prime caches
@@ -549,9 +588,7 @@ fn run_serve(args: Vec<String>) -> ExitCode {
                 "--img-ocr-models-dir" => cli.models_dir = it.next(),
                 other => {
                     eprintln!("error: unknown serve argument '{other}'");
-                    eprintln!(
-                        "usage: docmill serve [--addr HOST:PORT] [--img-ocr-* flags]"
-                    );
+                    eprintln!("usage: docmill serve [--addr HOST:PORT] [--img-ocr-* flags]");
                     return ExitCode::from(2);
                 }
             }
@@ -571,7 +608,9 @@ fn run_serve(args: Vec<String>) -> ExitCode {
     #[cfg(not(feature = "serve"))]
     {
         let _ = args;
-        usage_error("this binary was built without the serve feature (rebuild with --features serve)")
+        usage_error(
+            "this binary was built without the serve feature (rebuild with --features serve)",
+        )
     }
 }
 

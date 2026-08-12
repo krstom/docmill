@@ -18,10 +18,10 @@
 #      runtime via an rpath — no environment needed.
 #   4. Installs to $DOCMILL_PREFIX (default /usr/local/docmill):
 #        bin/docmill    the CLI
-#        models/…, .pdfium/…    runtime assets
+#        .models/…, .pdfium/…   runtime assets
 #        lib/…                  vendored onnxruntime (dynamic builds only)
 #      and symlinks it as /usr/local/bin/docmill. The binary resolves
-#      models and pdfium relative to its own (symlink-resolved) location, so
+#      .models and pdfium relative to its own (symlink-resolved) location, so
 #      it works from any working directory with no environment setup.
 #
 # Options (env vars):
@@ -99,8 +99,8 @@ env ${BUILD_ENV[@]+"${BUILD_ENV[@]}"} cargo build --release
 say "installing to $PREFIX"
 $SUDO mkdir -p "$PREFIX/bin"
 $SUDO cp target/release/docmill "$PREFIX/bin/docmill"
-$SUDO mkdir -p "$PREFIX/models"
-$SUDO cp -a models/. "$PREFIX/models/"
+$SUDO mkdir -p "$PREFIX/.models"
+$SUDO cp -a .models/. "$PREFIX/.models/"
 if [ -d .pdfium ]; then
   $SUDO mkdir -p "$PREFIX/.pdfium"
   $SUDO cp -a .pdfium/. "$PREFIX/.pdfium/"
@@ -122,5 +122,5 @@ printf '# docmill\n\ninstalled.\n' > "$TMP_MD"
 rm -f "$TMP_MD"
 
 say "done. Try:  docmill your.docx > out.md"
-say "layout: $PREFIX  (bin/, models/, .pdfium/$( [ -n "$RPATH_LIB" ] && printf ', lib/' ))"
+say "layout: $PREFIX  (bin/, .models/, .pdfium/$( [ -n "$RPATH_LIB" ] && printf ', lib/' ))"
 say "uninstall: rm -rf $PREFIX $BIN_DIR/docmill"

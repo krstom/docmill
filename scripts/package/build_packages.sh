@@ -7,7 +7,7 @@
 #
 # With no format flags, every format whose tool is installed is built.
 # --models additionally builds a companion `docmill-models` package
-# (the checkout's models/ + .pdfium/, several hundred MB) that installs into
+# (the checkout's .models/ + .pdfium/, several hundred MB) that installs into
 # the same /opt/docmill tree — the main package stays small and merely
 # suggests it. --with-models instead bundles everything into one fat package.
 #
@@ -20,7 +20,7 @@
 #                           $ORIGIN/../lib rpath, so the tree also works
 #                           extracted anywhere, not just under /opt
 #   scripts/…               download_dependencies.sh for fetching models
-#   models/, .pdfium/       only with --with-models (adds several hundred MB;
+#   .models/, .pdfium/      only with --with-models (adds several hundred MB;
 #                           default packages print a post-install hint to run
 #                           the download script instead)
 # plus a /usr/bin/docmill symlink in rpm/deb.
@@ -31,6 +31,16 @@ die() { printf '\033[1;31m[package]\033[0m %s\n' "$*" >&2; exit 1; }
 
 SRC_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$SRC_DIR"
+
+# docling.rs v1 resolves runtime models exclusively from `.models/`. Migrate
+# the old docmill layout when it is unambiguous; never merge or overwrite two
+# independently populated trees.
+if [ -d models ] && [ ! -e .models ]; then
+  say "migrating legacy models/ to .models/"
+  mv models .models
+elif [ -d models ] && [ -e .models ]; then
+  printf '%s\n' "[package] warning: both models/ and .models/ exist; preserving both and using .models/" >&2
+fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 [ -n "$VERSION" ] || die "cannot read version from Cargo.toml"
 ARCH="$(uname -m)"
@@ -100,8 +110,8 @@ if [ -n "$ORT_DIR" ]; then
 fi
 SUFFIX=""
 if [ "$WITH_MODELS" = true ]; then
-  [ -d models ] || die "--with-models: no models/ in the checkout (run download_dependencies.sh)"
-  cp -a models "$TREE/models"
+  [ -d .models ] || die "--with-models: no .models/ in the checkout (run download_dependencies.sh)"
+  cp -a .models "$TREE/.models"
   [ -d .pdfium ] && cp -a .pdfium "$TREE/.pdfium"
   SUFFIX="-with-models"
 fi
@@ -112,13 +122,13 @@ POST_HINT="Install the docmill-models package, or run \
 /opt/docmill to fetch the OCR/layout models (or point the binary at an \
 existing model tree with --img-ocr-models-dir)."
 
-# Companion models package: models/ + .pdfium/ under the same /opt tree.
+# Companion models package: .models/ + .pdfium/ under the same /opt tree.
 MSTAGE="$WORK/stage-models"
 if [ "$MODELS_PKG" = true ]; then
-  [ -d models ] || die "--models: no models/ in the checkout (run download_dependencies.sh)"
+  [ -d .models ] || die "--models: no .models/ in the checkout (run download_dependencies.sh)"
   MTREE="$MSTAGE/opt/docmill"
   mkdir -p "$MTREE"
-  cp -a models "$MTREE/models"
+  cp -a .models "$MTREE/.models"
   [ -d .pdfium ] && cp -a .pdfium "$MTREE/.pdfium"
 fi
 

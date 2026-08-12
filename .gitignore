@@ -1,4 +1,6 @@
 /target
+/.models
+# Legacy pre-docling.rs-v1 asset directory; install/download tooling migrates it.
 /models
 /.pdfium
 /vendor

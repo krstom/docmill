@@ -13,7 +13,7 @@ install time, subject to that component's own license.
 | [docling.rs](https://github.com/docling-project/docling.rs) (`docling`, `docling-core`, `docling-pdf`) | MIT | path dependency on a sibling checkout |
 | [ONNX Runtime](https://github.com/microsoft/onnxruntime) (via the [`ort`](https://github.com/pykeio/ort) crate, MIT/Apache-2.0) | MIT | statically linked by default, or the official shared build fetched with `--ort` |
 | [pdfium](https://pdfium.googlesource.com/pdfium/) (`libpdfium.so`) | BSD-3-Clause (with Apache-2.0-licensed parts) | prebuilt binary from the docling.rs models release |
-| Rust crate dependencies (`image`, `ureq`, `serde_json`, `sha2`, …) | MIT/Apache-2.0 dual (see each crate) | crates.io |
+| Rust crate dependencies (`calamine`, `zip`, `image`, `ureq`, `serde_json`, `sha2`, …) | MIT/Apache-2.0 or compatible permissive licenses (see each crate) | crates.io |
 
 ## Models (downloaded at install time)
 

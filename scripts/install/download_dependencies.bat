@@ -1,12 +1,12 @@
 @echo off
 rem Windows twin of download_dependencies.sh: fetch docmill's runtime
-rem dependencies into models\ and .pdfium\lib\ so a native (non-WSL) build
+rem dependencies into .models\ and .pdfium\lib\ so a native (non-WSL) build
 rem runs out of the box:
 rem
 rem     cargo build --release
 rem     target\release\docmill document.docx
 rem
-rem Everything lands relative to the repo root (the binary resolves models\
+rem Everything lands relative to the repo root (the binary resolves .models\
 rem and .pdfium\lib next to the CWD or the executable, no env vars needed).
 rem Models come from the same sources the sh script uses; pdfium.dll comes
 rem from pdfium-binaries (the docling.rs release only hosts the Linux .so).
@@ -43,7 +43,17 @@ goto parse
 
 rem repo root = two levels above this script
 cd /d "%~dp0..\.."
-if not exist models mkdir models
+rem docling.rs v1 resolves only .models\. Rename the old directory when that
+rem is unambiguous; if both exist, preserve them and use .models\.
+if exist models\NUL (
+  if not exist .models\NUL (
+    echo migrating legacy models\ to .models\
+    move models .models >nul
+  ) else (
+    echo warning: both models\ and .models\ exist; preserving both and using .models\ 1>&2
+  )
+)
+if not exist .models mkdir .models
 
 if "%WITH_PDF%"=="0" goto ocr_v3
 
@@ -59,29 +69,29 @@ if exist .pdfium\lib\pdfium.dll if "%FORCE%"=="0" (
   rmdir .pdfium\bin 2>nul
   del .pdfium\pdfium.tgz
 )
-call :fetch "%BASE_URL%/layout_heron.onnx" models\layout_heron.onnx || goto fail
-call :fetch_opt "%BASE_URL%/layout_heron_int8.onnx" models\layout_heron_int8.onnx
+call :fetch "%BASE_URL%/layout_heron.onnx" .models\layout_heron.onnx || goto fail
+call :fetch_opt "%BASE_URL%/layout_heron_int8.onnx" .models\layout_heron_int8.onnx
 
 if "%WITH_TF%"=="0" goto ocr_v3
-if not exist models\tableformer mkdir models\tableformer
-call :fetch "%BASE_URL%/encoder.onnx" models\tableformer\encoder.onnx || goto fail
-call :fetch_opt "%BASE_URL%/encoder.onnx.data" models\tableformer\encoder.onnx.data
-call :fetch "%BASE_URL%/decoder.onnx" models\tableformer\decoder.onnx || goto fail
-call :fetch_opt "%BASE_URL%/decoder.onnx.data" models\tableformer\decoder.onnx.data
-call :fetch_opt "%BASE_URL%/decoder_kv.onnx" models\tableformer\decoder_kv.onnx
-call :fetch_opt "%BASE_URL%/decoder_kv.onnx.data" models\tableformer\decoder_kv.onnx.data
-call :fetch "%BASE_URL%/bbox.onnx" models\tableformer\bbox.onnx || goto fail
-call :fetch_opt "%BASE_URL%/bbox.onnx.data" models\tableformer\bbox.onnx.data
+if not exist .models\tableformer mkdir .models\tableformer
+call :fetch "%BASE_URL%/encoder.onnx" .models\tableformer\encoder.onnx || goto fail
+call :fetch_opt "%BASE_URL%/encoder.onnx.data" .models\tableformer\encoder.onnx.data
+call :fetch "%BASE_URL%/decoder.onnx" .models\tableformer\decoder.onnx || goto fail
+call :fetch_opt "%BASE_URL%/decoder.onnx.data" .models\tableformer\decoder.onnx.data
+call :fetch_opt "%BASE_URL%/decoder_kv.onnx" .models\tableformer\decoder_kv.onnx
+call :fetch_opt "%BASE_URL%/decoder_kv.onnx.data" .models\tableformer\decoder_kv.onnx.data
+call :fetch "%BASE_URL%/bbox.onnx" .models\tableformer\bbox.onnx || goto fail
+call :fetch_opt "%BASE_URL%/bbox.onnx.data" .models\tableformer\bbox.onnx.data
 
 :ocr_v3
 echo fetching PP-OCRv3 recognition pairs
-call :fetch "%BASE_URL%/ocr_rec.onnx" models\ocr_rec.onnx || goto fail
-call :fetch "%BASE_URL%/ppocr_keys_v1.txt" models\ppocr_keys_v1.txt || goto fail
-call :fetch "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" models\ocr_rec_en.onnx || goto fail
-call :fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" models\en_dict.txt || goto fail
+call :fetch "%BASE_URL%/ocr_rec.onnx" .models\ocr_rec.onnx || goto fail
+call :fetch "%BASE_URL%/ppocr_keys_v1.txt" .models\ppocr_keys_v1.txt || goto fail
+call :fetch "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" .models\ocr_rec_en.onnx || goto fail
+call :fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" .models\en_dict.txt || goto fail
 
 if "%WITH_V5%"=="0" goto done
-if exist models\ppocrv5_mobile_det.onnx if exist models\ppocrv5_mobile_rec.onnx if "%FORCE%"=="0" (
+if exist .models\ppocrv5_mobile_det.onnx if exist .models\ppocrv5_mobile_rec.onnx if "%FORCE%"=="0" (
   echo   = PP-OCRv5 det+rec ^(already present^)
   goto done
 )
@@ -100,16 +110,16 @@ for %%m in (PP-OCRv5_mobile_det PP-OCRv5_mobile_rec) do (
     curl -fsSL -o "%TMPDIR_V5%\%%m\%%f" "%PADDLE_HF%/%%m/resolve/main/%%f" || goto v5fail
   )
 )
-python -m paddle2onnx --model_dir "%TMPDIR_V5%\PP-OCRv5_mobile_det" --model_filename inference.json --params_filename inference.pdiparams --save_file models\ppocrv5_mobile_det.onnx --opset_version 14 >nul 2>nul || goto v5fail
-python -m paddle2onnx --model_dir "%TMPDIR_V5%\PP-OCRv5_mobile_rec" --model_filename inference.json --params_filename inference.pdiparams --save_file models\ppocrv5_mobile_rec.onnx --opset_version 14 >nul 2>nul || goto v5fail
-call :fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt" models\ppocrv5_dict.txt || goto v5fail
-echo   ^> models\ppocrv5_mobile_det.onnx
-echo   ^> models\ppocrv5_mobile_rec.onnx
+python -m paddle2onnx --model_dir "%TMPDIR_V5%\PP-OCRv5_mobile_det" --model_filename inference.json --params_filename inference.pdiparams --save_file .models\ppocrv5_mobile_det.onnx --opset_version 14 >nul 2>nul || goto v5fail
+python -m paddle2onnx --model_dir "%TMPDIR_V5%\PP-OCRv5_mobile_rec" --model_filename inference.json --params_filename inference.pdiparams --save_file .models\ppocrv5_mobile_rec.onnx --opset_version 14 >nul 2>nul || goto v5fail
+call :fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt" .models\ppocrv5_dict.txt || goto v5fail
+echo   ^> .models\ppocrv5_mobile_det.onnx
+echo   ^> .models\ppocrv5_mobile_rec.onnx
 rmdir /s /q "%TMPDIR_V5%" 2>nul
 goto done
 
 :v5fail
-del models\ppocrv5_mobile_det.onnx models\ppocrv5_mobile_rec.onnx 2>nul
+del .models\ppocrv5_mobile_det.onnx .models\ppocrv5_mobile_rec.onnx 2>nul
 rmdir /s /q "%TMPDIR_V5%" 2>nul
 echo warning: PP-OCRv5 fetch/conversion failed -- the v3 fallback still works 1>&2
 goto done

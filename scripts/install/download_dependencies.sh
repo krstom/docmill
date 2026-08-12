@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Fetch docmill's runtime dependencies into the current directory —
-# the same layout docling.rs uses (models/ + .pdfium/lib), plus the
+# the same layout docling.rs uses (.models/ + .pdfium/lib), plus the
 # PP-OCRv5 detection/recognition pair that powers the local picture-OCR
 # engine's screenshot-grade quality.
 #
@@ -9,12 +9,12 @@
 #
 # Downloads:
 #   .pdfium/lib/libpdfium.so                    page rendering (PDF input)
-#   models/layout_heron.onnx                    RT-DETR layout (PDF input)
-#   models/tableformer/{encoder,decoder,bbox}.onnx  table structure (PDF input)
-#   models/ocr_rec.onnx + ppocr_keys_v1.txt     PP-OCRv3 ch pair (page OCR +
-#   models/ocr_rec_en.onnx + en_dict.txt          v3 picture-OCR fallback)
-#   models/ppocrv5_mobile_{det,rec}.onnx        PP-OCRv5 det+rec — converted
-#   models/ppocrv5_dict.txt                       locally with paddle2onnx from
+#   .models/layout_heron.onnx                    RT-DETR layout (PDF input)
+#   .models/tableformer/{encoder,decoder,bbox}.onnx table structure (PDF input)
+#   .models/ocr_rec.onnx + ppocr_keys_v1.txt     PP-OCRv3 ch pair (page OCR +
+#   .models/ocr_rec_en.onnx + en_dict.txt          v3 picture-OCR fallback)
+#   .models/ppocrv5_mobile_{det,rec}.onnx        PP-OCRv5 det+rec — converted
+#   .models/ppocrv5_dict.txt                       locally with paddle2onnx from
 #                                                 the official PaddlePaddle
 #                                                 Hugging Face repos (needs
 #                                                 python3 + pip; skipped with a
@@ -55,7 +55,16 @@ done
 
 command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
 
-mkdir -p models
+# docling.rs v1 dropped the legacy `models/` fallback. Preserve existing user
+# data when both directories exist; otherwise make the one-time rename before
+# downloading so already-fetched assets are reused.
+if [ -d models ] && [ ! -e .models ]; then
+  echo "migrating legacy models/ to .models/"
+  mv models .models
+elif [ -d models ] && [ -e .models ]; then
+  echo "warning: both models/ and .models/ exist; preserving both and using .models/" >&2
+fi
+mkdir -p .models
 
 # Same transfer guards as docling.rs: bounded connect, stall abort, retries.
 CURL_TIMEOUTS="--connect-timeout 30 --speed-limit 1024 --speed-time 60 --retry 3 --retry-delay 2"
@@ -114,27 +123,27 @@ if [ "$WITH_PDF" = true ]; then
   echo "fetching PDF pipeline assets from $BASE_URL"
   mkdir -p .pdfium/lib
   fetch_pdfium
-  fetch "$BASE_URL/layout_heron.onnx" models/layout_heron.onnx
-  fetch_optional "$BASE_URL/layout_heron_int8.onnx" models/layout_heron_int8.onnx
+  fetch "$BASE_URL/layout_heron.onnx" .models/layout_heron.onnx
+  fetch_optional "$BASE_URL/layout_heron_int8.onnx" .models/layout_heron_int8.onnx
   if [ "$WITH_TABLEFORMER" = true ]; then
-    mkdir -p models/tableformer
-    fetch "$BASE_URL/encoder.onnx" models/tableformer/encoder.onnx
-    fetch_optional "$BASE_URL/encoder.onnx.data" models/tableformer/encoder.onnx.data
-    fetch "$BASE_URL/decoder.onnx" models/tableformer/decoder.onnx
-    fetch_optional "$BASE_URL/decoder.onnx.data" models/tableformer/decoder.onnx.data
-    fetch_optional "$BASE_URL/decoder_kv.onnx" models/tableformer/decoder_kv.onnx
-    fetch_optional "$BASE_URL/decoder_kv.onnx.data" models/tableformer/decoder_kv.onnx.data
-    fetch "$BASE_URL/bbox.onnx" models/tableformer/bbox.onnx
-    fetch_optional "$BASE_URL/bbox.onnx.data" models/tableformer/bbox.onnx.data
+    mkdir -p .models/tableformer
+    fetch "$BASE_URL/encoder.onnx" .models/tableformer/encoder.onnx
+    fetch_optional "$BASE_URL/encoder.onnx.data" .models/tableformer/encoder.onnx.data
+    fetch "$BASE_URL/decoder.onnx" .models/tableformer/decoder.onnx
+    fetch_optional "$BASE_URL/decoder.onnx.data" .models/tableformer/decoder.onnx.data
+    fetch_optional "$BASE_URL/decoder_kv.onnx" .models/tableformer/decoder_kv.onnx
+    fetch_optional "$BASE_URL/decoder_kv.onnx.data" .models/tableformer/decoder_kv.onnx.data
+    fetch "$BASE_URL/bbox.onnx" .models/tableformer/bbox.onnx
+    fetch_optional "$BASE_URL/bbox.onnx.data" .models/tableformer/bbox.onnx.data
   fi
 fi
 
 # --- PP-OCRv3 pairs (page OCR + v3 picture-OCR fallback) ---------------------
 echo "fetching PP-OCRv3 recognition pairs"
-fetch "$BASE_URL/ocr_rec.onnx" models/ocr_rec.onnx
-fetch "$BASE_URL/ppocr_keys_v1.txt" models/ppocr_keys_v1.txt
-fetch "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" models/ocr_rec_en.onnx
-fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" models/en_dict.txt
+fetch "$BASE_URL/ocr_rec.onnx" .models/ocr_rec.onnx
+fetch "$BASE_URL/ppocr_keys_v1.txt" .models/ppocr_keys_v1.txt
+fetch "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" .models/ocr_rec_en.onnx
+fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" .models/en_dict.txt
 
 # --- PP-OCRv5 det+rec (the local picture-OCR engine's preferred models) ------
 # No public host serves these as ONNX, so we fetch the official PaddlePaddle
@@ -142,8 +151,8 @@ fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils
 # model-format conversion, done once. The result is 22 MB of ONNX; the
 # paddle/python toolchain is only needed here, never at runtime.
 if [ "$WITH_V5" = true ]; then
-  if [ "$FORCE" = false ] && [ -f models/ppocrv5_mobile_det.onnx ] \
-      && [ -f models/ppocrv5_mobile_rec.onnx ] && [ -f models/ppocrv5_dict.txt ]; then
+  if [ "$FORCE" = false ] && [ -f .models/ppocrv5_mobile_det.onnx ] \
+      && [ -f .models/ppocrv5_mobile_rec.onnx ] && [ -f .models/ppocrv5_dict.txt ]; then
     echo "  = PP-OCRv5 det+rec (already present)"
   elif ! command -v python3 >/dev/null 2>&1; then
     echo "warning: python3 not found — skipping PP-OCRv5 conversion (the v3 fallback still works;" >&2
@@ -172,16 +181,16 @@ if [ "$WITH_V5" = true ]; then
       done
       if [ "$ok" = true ] \
         && "$P2O" --model_dir "$TMP/PP-OCRv5_mobile_det" --model_filename inference.json \
-             --params_filename inference.pdiparams --save_file models/ppocrv5_mobile_det.onnx \
+             --params_filename inference.pdiparams --save_file .models/ppocrv5_mobile_det.onnx \
              --opset_version 14 >/dev/null 2>&1 \
         && "$P2O" --model_dir "$TMP/PP-OCRv5_mobile_rec" --model_filename inference.json \
-             --params_filename inference.pdiparams --save_file models/ppocrv5_mobile_rec.onnx \
+             --params_filename inference.pdiparams --save_file .models/ppocrv5_mobile_rec.onnx \
              --opset_version 14 >/dev/null 2>&1; then
-        echo "  > models/ppocrv5_mobile_det.onnx"
-        echo "  > models/ppocrv5_mobile_rec.onnx"
-        fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt" models/ppocrv5_dict.txt
+        echo "  > .models/ppocrv5_mobile_det.onnx"
+        echo "  > .models/ppocrv5_mobile_rec.onnx"
+        fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv5_dict.txt" .models/ppocrv5_dict.txt
       else
-        rm -f models/ppocrv5_mobile_det.onnx models/ppocrv5_mobile_rec.onnx
+        rm -f .models/ppocrv5_mobile_det.onnx .models/ppocrv5_mobile_rec.onnx
         echo "warning: PP-OCRv5 fetch/conversion failed — the v3 fallback still works" >&2
       fi
     fi

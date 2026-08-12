@@ -18,6 +18,7 @@
 //! wasted on header logos that can't appear in the output.
 
 use docling_core::{ContentLayer, DoclingDocument, Node};
+use std::collections::HashMap;
 
 use crate::engine::OcrRunner;
 
@@ -64,6 +65,9 @@ pub struct OcrStats {
     /// Of `ocred` + `empty`, how many came from the disk cache.
     pub cached: usize,
     pub skipped_small: usize,
+    /// Picture OCR skipped because a structured table from the same page is
+    /// substantially contained by the picture region.
+    pub skipped_structured: usize,
     /// OCR ran and legitimately found no text: the picture is dropped from
     /// the output entirely (no placeholder) — unless the image itself renders
     /// (`keep_picture`), in which case the node stays.
@@ -76,8 +80,14 @@ impl std::fmt::Display for OcrStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "docmill: {} picture(s), {} ocr'd ({} cached), {} skipped (small), {} empty, {} failed",
-            self.pictures, self.ocred, self.cached, self.skipped_small, self.empty, self.failed
+            "docmill: {} picture(s), {} ocr'd ({} cached), {} skipped (small), {} skipped (structured table), {} empty, {} failed",
+            self.pictures,
+            self.ocred,
+            self.cached,
+            self.skipped_small,
+            self.skipped_structured,
+            self.empty,
+            self.failed
         )
     }
 }
@@ -98,13 +108,25 @@ pub fn one_picture_document(name: &str, bytes: Vec<u8>, strict: bool) -> Docling
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let mimetype = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "tif" | "tiff" => "image/tiff",
-        "webp" => "image/webp",
-        _ => "image/png",
+    let mimetype = if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.starts_with(b"BM") {
+        "image/bmp"
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        "image/tiff"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            "tif" | "tiff" => "image/tiff",
+            "webp" => "image/webp",
+            _ => "image/png",
+        }
     };
     let stem = std::path::Path::new(name)
         .file_stem()
@@ -125,6 +147,7 @@ pub fn one_picture_document(name: &str, bytes: Vec<u8>, strict: bool) -> Docling
         strict_markdown: strict,
         compact_tables: false,
         links: Vec::new(),
+        confidence: None,
     }
 }
 
@@ -132,8 +155,57 @@ pub fn one_picture_document(name: &str, bytes: Vec<u8>, strict: bool) -> Docling
 /// document is modified in place.
 pub fn apply(doc: &mut DoclingDocument, runner: &mut OcrRunner, opts: &PostOptions) -> OcrStats {
     let mut stats = OcrStats::default();
-    walk(&mut doc.nodes, false, runner, opts, &mut stats);
+    let table_locations = table_locations(&doc.nodes);
+    let mut page = 0usize;
+    walk(
+        &mut doc.nodes,
+        false,
+        &mut page,
+        &table_locations,
+        runner,
+        opts,
+        &mut stats,
+    );
     stats
+}
+
+type TableLocations = HashMap<usize, Vec<[u16; 4]>>;
+
+fn table_locations(nodes: &[Node]) -> TableLocations {
+    fn collect(nodes: &[Node], page: &mut usize, out: &mut TableLocations) {
+        for node in nodes {
+            if let Node::PageInfo { page_no, .. } = node {
+                *page = *page_no;
+                continue;
+            }
+            let (wraps, inner) = peel(node);
+            if let Node::Group { children, .. } = inner {
+                collect(children, page, out);
+                continue;
+            }
+            let Node::Table(table) = inner else { continue };
+            if !table
+                .rows
+                .iter()
+                .flatten()
+                .any(|cell| !cell.trim().is_empty())
+            {
+                continue;
+            }
+            let wrapper_location = wraps.iter().find_map(|wrap| match wrap {
+                Wrap::Located(location) => Some(*location),
+                _ => None,
+            });
+            if let Some(location) = wrapper_location.or(table.location) {
+                out.entry(*page).or_default().push(location);
+            }
+        }
+    }
+
+    let mut out = HashMap::new();
+    let mut page = 0usize;
+    collect(nodes, &mut page, &mut out);
+    out
 }
 
 /// A wrapper layer peeled off on the way down to a Picture, reapplied to
@@ -222,24 +294,47 @@ fn group_children(node: &mut Node) -> Option<&mut Vec<Node>> {
 fn walk(
     nodes: &mut Vec<Node>,
     hidden: bool,
+    page: &mut usize,
+    table_locations: &TableLocations,
     runner: &mut OcrRunner,
     opts: &PostOptions,
     stats: &mut OcrStats,
 ) {
     let mut i = 0;
     while i < nodes.len() {
+        if let Node::PageInfo { page_no, .. } = &nodes[i] {
+            *page = *page_no;
+            i += 1;
+            continue;
+        }
         // Wrapped groups first (e.g. a Located slide group): recurse, marking
         // the subtree hidden when any wrapper on the way is a hidden layer.
         {
             let (wraps, _) = peel(&nodes[i]);
             let sub_hidden = hidden || wraps.iter().any(|w| w.hidden());
             if let Some(children) = group_children(&mut nodes[i]) {
-                walk(children, sub_hidden, runner, opts, stats);
+                walk(
+                    children,
+                    sub_hidden,
+                    page,
+                    table_locations,
+                    runner,
+                    opts,
+                    stats,
+                );
                 i += 1;
                 continue;
             }
         }
-        match replacement_for(&nodes[i], hidden, runner, opts, stats) {
+        match replacement_for(
+            &nodes[i],
+            hidden,
+            *page,
+            table_locations,
+            runner,
+            opts,
+            stats,
+        ) {
             Some(mut replacement) => {
                 if opts.keep_picture {
                     // Steal the original node so its (possibly large) image
@@ -262,6 +357,8 @@ fn walk(
 fn replacement_for(
     node: &Node,
     hidden: bool,
+    page: usize,
+    table_locations: &TableLocations,
     runner: &mut OcrRunner,
     opts: &PostOptions,
     stats: &mut OcrStats,
@@ -274,6 +371,18 @@ fn replacement_for(
     let img = image.as_ref()?;
     let hidden_here = hidden || wraps.iter().any(|w| w.hidden());
     if hidden_here && !opts.ocr_hidden {
+        return None;
+    }
+    let picture_location = wraps.iter().find_map(|wrap| match wrap {
+        Wrap::Located(location) => Some(*location),
+        _ => None,
+    });
+    if picture_location.is_some_and(|picture| {
+        table_locations
+            .get(&page)
+            .is_some_and(|tables| tables.iter().any(|table| contains_table(picture, *table)))
+    }) {
+        stats.skipped_structured += 1;
         return None;
     }
     let area = img.width.saturating_mul(img.height);
@@ -329,6 +438,7 @@ fn replacement_for(
                 language: None,
                 text: defuse_fences(&body),
                 orig: None,
+                pretty: None,
             });
         }
         OutputMode::Markers => {
@@ -366,6 +476,24 @@ fn replacement_for(
     Some(parts.into_iter().map(|n| rewrap(&wraps, n)).collect())
 }
 
+/// True when at least 80% of the structured table lies inside the picture.
+fn contains_table(picture: [u16; 4], table: [u16; 4]) -> bool {
+    let [px0, py0, px1, py1] = picture;
+    let [tx0, ty0, tx1, ty1] = table;
+    let table_width = tx1.saturating_sub(tx0) as u64;
+    let table_height = ty1.saturating_sub(ty0) as u64;
+    let table_area = table_width.saturating_mul(table_height);
+    if table_area == 0 {
+        return false;
+    }
+    let ix0 = px0.max(tx0);
+    let iy0 = py0.max(ty0);
+    let ix1 = px1.min(tx1);
+    let iy1 = py1.min(ty1);
+    let intersection = ix1.saturating_sub(ix0) as u64 * iy1.saturating_sub(iy0) as u64;
+    intersection.saturating_mul(100) >= table_area.saturating_mul(80)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +522,7 @@ mod tests {
             strict_markdown: false,
             compact_tables: false,
             links: Vec::new(),
+            confidence: None,
         }
     }
 
@@ -439,22 +568,32 @@ mod tests {
         // The inner fences are neutralized, the outer fence stays balanced:
         // exactly two lines consist of a bare ``` (open + close).
         assert!(md.contains(" ```sh"), "{md:?}");
-        let bare = md.lines().filter(|l| l.trim() == "```" && !l.starts_with(' ')).count();
+        let bare = md
+            .lines()
+            .filter(|l| l.trim() == "```" && !l.starts_with(' '))
+            .count();
         assert_eq!(bare, 2, "outer fence only: {md:?}");
     }
 
     #[test]
     fn markers_mode_replaces_placeholder() {
         let mut d = doc(vec![
-            Node::Paragraph { text: "before".into() },
+            Node::Paragraph {
+                text: "before".into(),
+            },
             picture(100, 100),
-            Node::Paragraph { text: "after".into() },
+            Node::Paragraph {
+                text: "after".into(),
+            },
         ]);
         let mut r = runner(vec![Ok("line one\nline two".into())]);
         let stats = apply(&mut d, &mut r, &opts(OutputMode::Markers));
         assert_eq!((stats.pictures, stats.ocred), (1, 1));
         let md = d.export_to_markdown();
-        assert!(!md.contains("<!-- image -->"), "placeholder replaced: {md:?}");
+        assert!(
+            !md.contains("<!-- image -->"),
+            "placeholder replaced: {md:?}"
+        );
         let expected = "before\n\n<!-- ocr:begin engine=mock -->\n\nline one\nline two\n\n<!-- ocr:end -->\n\nafter";
         assert!(md.contains(expected), "markers block: {md:?}");
     }
@@ -493,9 +632,13 @@ mod tests {
     #[test]
     fn empty_ocr_drops_picture_and_placeholder() {
         let mut d = doc(vec![
-            Node::Paragraph { text: "before".into() },
+            Node::Paragraph {
+                text: "before".into(),
+            },
             picture(100, 100),
-            Node::Paragraph { text: "after".into() },
+            Node::Paragraph {
+                text: "after".into(),
+            },
         ]);
         let mut r = runner(vec![Ok("   \n  ".into())]);
         let stats = apply(&mut d, &mut r, &opts(OutputMode::Markers));
@@ -565,7 +708,10 @@ mod tests {
         let stats = apply(&mut d, &mut r, &o);
         assert_eq!((stats.skipped_small, stats.ocred), (1, 1));
         let md = d.export_to_markdown();
-        assert!(md.contains("<!-- image -->"), "small one keeps placeholder: {md:?}");
+        assert!(
+            md.contains("<!-- image -->"),
+            "small one keeps placeholder: {md:?}"
+        );
         assert!(md.contains("big"), "{md:?}");
     }
 
@@ -630,7 +776,11 @@ mod tests {
         let mut d = doc(vec![furniture_pic()]);
         let stats = apply(&mut d, &mut r, &opts(OutputMode::Text));
         assert_eq!((stats.pictures, stats.ocred), (1, 0));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no engine call for hidden layers");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no engine call for hidden layers"
+        );
         // DocLang target: OCR'd, and the insertion stays furniture.
         let mut d = doc(vec![furniture_pic()]);
         let mut r = runner(vec![Ok("header".into())]);
@@ -653,14 +803,19 @@ mod tests {
         assert!(matches!(&d.nodes[0], Node::Picture { image: Some(_), .. }));
         assert!(matches!(&d.nodes[1], Node::Paragraph { .. }));
         // Embedded image mode: both the data URI and the text render.
-        let (md, _) = d.export_to_markdown_with_images(docling_core::ImageMode::Embedded, "artifacts");
+        let (md, _) =
+            d.export_to_markdown_with_images(docling_core::ImageMode::Embedded, "artifacts");
         assert!(md.contains("![Image](data:image/png;base64,"), "{md:?}");
         assert!(md.contains("visible text"), "{md:?}");
     }
 
     #[test]
     fn multiple_pictures_all_processed() {
-        let mut d = doc(vec![picture(100, 100), Node::Paragraph { text: "mid".into() }, picture(90, 90)]);
+        let mut d = doc(vec![
+            picture(100, 100),
+            Node::Paragraph { text: "mid".into() },
+            picture(90, 90),
+        ]);
         let mut r = runner(vec![Ok("first".into()), Ok("second".into())]);
         let stats = apply(&mut d, &mut r, &opts(OutputMode::Markers));
         assert_eq!(stats.ocred, 2);
@@ -671,5 +826,68 @@ mod tests {
             md.find("second").unwrap(),
         );
         assert!(a < b && b < c, "order preserved: {md:?}");
+    }
+
+    #[test]
+    fn upstream_rtf_picture_reaches_picture_ocr() {
+        let png_hex = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082";
+        let rtf = format!(r"{{\rtf1\ansi{{\pict\pngblip\picw100\pich100 {png_hex}}}\par}}")
+            .into_bytes();
+        let source = docling::SourceDocument::from_bytes(
+            "picture.rtf",
+            docling::InputFormat::Rtf,
+            rtf,
+        );
+        let mut document = docling::DocumentConverter::new()
+            .convert(source)
+            .unwrap()
+            .document;
+        let mut runner = runner(vec![Ok("chosen paddle text".into())]);
+
+        let stats = apply(&mut document, &mut runner, &opts(OutputMode::Text));
+
+        assert_eq!(stats.ocred, 1);
+        assert!(document.export_to_markdown().contains("chosen paddle text"));
+    }
+
+    #[test]
+    fn structured_table_on_same_page_suppresses_picture_ocr() {
+        let table = docling_core::Table {
+            rows: vec![vec!["A".into(), "B".into()]],
+            location: None,
+            structure: None,
+            cell_blocks: None,
+            caption: None,
+        };
+        let mut d = doc(vec![
+            Node::PageInfo {
+                page_no: 1,
+                width: 100.0,
+                height: 100.0,
+            },
+            Node::Located {
+                location: [10, 10, 110, 110],
+                inner: Box::new(Node::Table(table)),
+            },
+            Node::Located {
+                // Exactly 80% of the table is inside this picture.
+                location: [0, 0, 90, 110],
+                inner: Box::new(picture(100, 100)),
+            },
+        ]);
+        let (engine, calls) = MockEngine::new("mock", vec![Ok("duplicate".into())]);
+        let mut runner = OcrRunner::new(vec![Box::new(engine)], OcrCache::disabled());
+        let stats = apply(&mut d, &mut runner, &opts(OutputMode::Text));
+        assert_eq!(stats.skipped_structured, 1);
+        assert_eq!(stats.ocred, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(d.export_to_markdown().contains("<!-- image -->"));
+    }
+
+    #[test]
+    fn table_overlap_threshold_is_eighty_percent() {
+        assert!(contains_table([0, 0, 80, 100], [0, 0, 100, 100]));
+        assert!(!contains_table([0, 0, 79, 100], [0, 0, 100, 100]));
+        assert!(!contains_table([0, 0, 100, 100], [10, 10, 10, 50]));
     }
 }

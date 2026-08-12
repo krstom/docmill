@@ -71,13 +71,13 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// Default `models/` location, mirroring docling-pdf's `resolve_asset`: the
+/// Default `.models/` location, mirroring docling-pdf's asset resolver: the
 /// current directory when it has one, else next to the (symlink-resolved)
 /// executable or its parent — which is what makes the installed tree
-/// (`$PREFIX/{bin/docmill, models/}` with a symlink on PATH) work
+/// (`$PREFIX/{bin/docmill, .models/}` with a symlink on PATH) work
 /// from any working directory.
 fn default_models_dir() -> PathBuf {
-    let cwd = PathBuf::from("models");
+    let cwd = PathBuf::from(".models");
     if cwd.exists() {
         return cwd;
     }
@@ -87,7 +87,7 @@ fn default_models_dir() -> PathBuf {
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
     {
         for base in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
-            let p = base.join("models");
+            let p = base.join(".models");
             if p.exists() {
                 return p;
             }

@@ -63,7 +63,7 @@ pub struct LocalPpocr {
 
 impl LocalPpocr {
     /// `models_dir` is where the model files live — typically the docling.rs
-    /// checkout's `models/` directory. The v5 triple wins when present;
+    /// checkout's `.models/` directory. The v5 triple wins when present;
     /// explicit env paths win over everything:
     /// `DOCMILL_{DET_ONNX,REC_ONNX,DICT}` select a v5 set,
     /// `DOCLING_OCR_REC_ONNX`/`DOCLING_OCR_DICT` the v3 pair (same contract
@@ -107,11 +107,23 @@ impl LocalPpocr {
 /// Pick v5 (env triple, else on-disk triple) or fall back to the v3 pair.
 fn resolve_models(lang: &str, models_dir: &Path) -> Models {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).map(PathBuf::from);
-    if let (Some(det), Some(rec), Some(dict)) = (
+    let explicit = match (
         env("DOCMILL_DET_ONNX"),
         env("DOCMILL_REC_ONNX"),
         env("DOCMILL_DICT"),
     ) {
+        (Some(det), Some(rec), Some(dict)) => Some((det, rec, dict)),
+        _ => None,
+    };
+    resolve_models_with_override(lang, models_dir, explicit)
+}
+
+fn resolve_models_with_override(
+    lang: &str,
+    models_dir: &Path,
+    explicit: Option<(PathBuf, PathBuf, PathBuf)>,
+) -> Models {
+    if let Some((det, rec, dict)) = explicit {
         return Models::V5 { det, rec, dict };
     }
     let v5 = (
@@ -285,6 +297,47 @@ impl OcrEngine for LocalPpocr {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_v5_triple_is_preferred_in_models_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "ppocrv5_mobile_det.onnx",
+            "ppocrv5_mobile_rec.onnx",
+            "ppocrv5_dict.txt",
+        ] {
+            std::fs::write(dir.path().join(name), b"test").unwrap();
+        }
+
+        match resolve_models_with_override("en", dir.path(), None) {
+            Models::V5 { det, rec, dict } => {
+                assert_eq!(det, dir.path().join("ppocrv5_mobile_det.onnx"));
+                assert_eq!(rec, dir.path().join("ppocrv5_mobile_rec.onnx"));
+                assert_eq!(dict, dir.path().join("ppocrv5_dict.txt"));
+            }
+            Models::V3 { .. } => panic!("complete PP-OCRv5 triple must win"),
+        }
+    }
+
+    #[test]
+    fn explicit_v5_triple_wins_over_models_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = (
+            PathBuf::from("chosen-det.onnx"),
+            PathBuf::from("chosen-rec.onnx"),
+            PathBuf::from("chosen-dict.txt"),
+        );
+
+        match resolve_models_with_override("en", dir.path(), Some(explicit.clone())) {
+            Models::V5 { det, rec, dict } => assert_eq!((det, rec, dict), explicit),
+            Models::V3 { .. } => panic!("explicit PP-OCRv5 triple must win"),
         }
     }
 }

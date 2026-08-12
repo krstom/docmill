@@ -3,7 +3,9 @@
 Convert documents with [docling.rs](https://github.com/docling-project/docling.rs)
 and additionally **OCR the pictures embedded in them** — DOCX drawings, PDF
 figure regions, standalone image files — where plain `docling-rs` emits only an
-`<!-- image -->` placeholder.
+`<!-- image -->` placeholder. Document parsing and format support come from
+docling.rs; docmill post-processes the extracted picture nodes with the chosen
+OCR engine.
 
 Standalone project: it builds against a sibling `../docling.rs` checkout via
 path dependencies and never modifies it. With OCR disabled
@@ -43,7 +45,7 @@ version.
 ## Example
 
 ```console
-$ docmill --img-ocr-engine local --img-ocr-models-dir ../docling.rs/models invoice.docx
+$ docmill --img-ocr-engine local --img-ocr-models-dir ../docling.rs/.models invoice.docx
 Text before the picture.
 
 <!-- ocr:begin engine=ppocr -->
@@ -102,7 +104,7 @@ the model/endpoint/prompt invalidates naturally. Empty results are cached too
 (negative caching). A run reports what happened:
 
 ```
-docmill: 7 picture(s), 5 ocr'd (3 cached), 1 skipped (small), 1 empty, 0 failed
+docmill: 7 picture(s), 5 ocr'd (3 cached), 1 skipped (small), 0 skipped (structured table), 1 empty, 0 failed
 ```
 
 ## All flags / env vars
@@ -123,7 +125,7 @@ Every `--img-ocr-*` flag falls back to a `DOCMILL_*` env var
 | `--img-ocr-cache-dir DIR` | `DOCMILL_CACHE_DIR` | `~/.cache/docmill` |
 | `--no-img-ocr-cache` | — | cache on |
 | `--img-ocr-timeout SECS` | `DOCMILL_TIMEOUT` | `120` |
-| `--img-ocr-models-dir DIR` | `DOCMILL_MODELS_DIR` | `./models` |
+| `--img-ocr-models-dir DIR` | `DOCMILL_MODELS_DIR` | `./.models` |
 
 `DOCMILL_EXTRA_BODY` merges a JSON object into every vlm request
 (server-specific knobs the OpenAI shape doesn't cover). The local engine also
@@ -134,18 +136,18 @@ for the v3 pair. `--img-ocr-lang` applies to v3 only — the v5 dictionary is
 multilingual.
 
 Conversion flags carried over from `docling-rs` (same semantics, buffered
-path): `--to md|json|dclx`, `-o/--output FILE`, `--strict`, `--pages A-B`,
+path): `--to md|json|dclx|chunks`, `-o/--output FILE`, `--strict`, `--pages A-B`,
 `--images placeholder|embedded|referenced`, `--fetch-images`,
 `--no-table-former`, `--no-ocr`, `--force-full-page-ocr` (OCR every PDF page
 even when it has a text layer), `--no-text-panels` (keep every detected
 picture as a picture instead of demoting text panels to paragraphs),
 `--ocr-lang en|ch` (the PDF pipeline's own page OCR — independent of picture
-OCR), `--enrich-*`.
+OCR), `--asr-model`, `--asr-lang CODE|auto`, `--video-frames`, and `--enrich-*`.
 
-Tracking docling.rs: as of v0.52.x the upstream pipeline also brings, with no
-flags needed, scanned-table extraction (OCR feeds TableFormer's cell matcher),
-an fp32 layout retry for pages the int8 model misreads, xref repair for broken
-PDFs, and JSON exports carrying page geometry and per-item provenance.
+Tracking docling.rs: this release targets **v1.4.2**. It inherits upstream's
+RTF and XLSB backends, TSV/GIF/MPEG aliases, Visio and SVG, Apple iWork,
+StarOffice/OpenOffice formats, dBase/DIF/SYLK, scanned-page orientation fixes,
+and the intervening PDF fidelity and performance improvements.
 
 ## Format specifics
 
@@ -155,7 +157,16 @@ PDFs, and JSON exports carrying page geometry and per-item provenance.
   to the next engine in the chain.
 - **PDF** (`pdf` feature, default): the ML pipeline crops every detected
   figure region; those crops are OCR'd. `--no-ocr` (text-layer-only mode)
-  produces no crops, so there is nothing to picture-OCR.
+  produces no crops, so there is nothing to picture-OCR. When docling already
+  recovered a non-empty structured table from a table screenshot, docmill
+  skips picture OCR if at least 80% of that table lies inside the picture on
+  the same page. The picture/placeholder remains, avoiding duplicate table
+  text while preserving the original figure.
+- **RTF**: converted by docling.rs. Embedded PNG/JPEG pictures retain their
+  bytes and therefore pass through docmill's selected picture-OCR engine.
+- **XLSB**: converted by docling.rs's cells-first Calamine path. Its reader does
+  not expose drawings, charts, comments, or embedded picture bytes, so those
+  items cannot be picture-OCRed.
 - **Standalone images** (PNG/JPEG/TIFF/…): with a local-first chain the image
   runs through docling's full ML pipeline (layout + text OCR + tables) and
   detected figure sub-regions are OCR'd like PDF figures. With a
@@ -170,7 +181,7 @@ PDFs, and JSON exports carrying page geometry and per-item provenance.
 ## Installing
 
 One command builds from source and installs a self-contained tree under
-`/usr/local/docmill` (binary + models + pdfium) with a
+`/usr/local/docmill` (binary + `.models` + pdfium) with a
 `docmill` symlink in `/usr/local/bin` — same install shape as
 docling.rs. The binary resolves its assets relative to its own
 (symlink-resolved) location, so it works from any directory with no
@@ -199,6 +210,11 @@ Flags: `--force` re-fetch, `--no-pdf` (skip pdfium/layout/TableFormer),
 python3 + pip for a one-time paddle2onnx run), `--ort` (vendor the ONNX
 Runtime shared build for old-glibc hosts — see below; install.sh then links
 it dynamically with an rpath into the prefix automatically).
+
+docling.rs v1 resolves runtime assets from `.models/` only. The download,
+install, and package scripts automatically rename a legacy `models/` directory
+when `.models/` is absent. If both exist, they preserve both, warn, and use
+`.models/` without merging or overwriting either tree.
 
 ## Web service (`docmill serve`)
 
@@ -248,7 +264,7 @@ environment needed.
 
 The main packages are small (~15–20 MB, no models) and print a post-install
 hint. Models ship separately with `--models`: a companion
-**`docmill-models`** package (models/ + pdfium, ~500 MB) installing
+**`docmill-models`** package (`.models/` + pdfium, ~500 MB) installing
 into the same `/opt/docmill` tree — the main rpm/deb `Suggests` it,
 it `Enhances` the main one, and either can be installed/upgraded without
 the other. Tarball users extract both archives over the same root.
@@ -262,10 +278,10 @@ from the official pdfium-binaries builds; ort's static onnxruntime download
 works natively there, so the glibc workaround below is Linux-only).
 **Windows** uses `scripts\install\download_dependencies.bat` (needs the
 curl.exe/tar.exe that ship with Windows 10+), then a plain
-`cargo build --release` from the repo root — the binary resolves `models\`
+`cargo build --release` from the repo root — the binary resolves `.models\`
 and `.pdfium\lib` next to the CWD or the executable. `install.sh` targets
 Unix prefixes; on Windows run from the repo root or copy the binary next to
-its `models\` directory.
+its `.models\` directory.
 
 ## Building manually
 
@@ -274,7 +290,9 @@ $ git clone <docling.rs> ../docling.rs   # sibling checkout
 $ cargo build --release                  # downloads all other deps from crates.io
 ```
 
-Features: `default = ["pdf", "asr", "fetch-images", "local-ocr"]`. A
+Features: `default = ["pdf", "asr", "fetch-images", "vlm", "local-ocr", "serve"]`.
+RTF and XLSB are provided by docling.rs and remain available in
+`--no-default-features` builds. A
 remote-only build with no onnxruntime link at all (converts every declarative
 format, OCRs via vlm/paddle):
 
@@ -297,8 +315,9 @@ $ LD_LIBRARY_PATH=$ORT_LIB_LOCATION target/release/docmill …
 
 ## Tests
 
-`cargo test` — the unit suite (cache, post-processor with a mock engine,
-remote-response parsers, config resolution) needs no models and no network.
+`cargo test` — the unit suite (content-first format detection, cache,
+post-processor with a mock engine, remote-response parsers, config resolution)
+needs no models and no network.
 On old-glibc hosts run it as `cargo test --no-default-features` or with the
 `ORT_LIB_LOCATION` setup above.
 
