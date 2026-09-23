@@ -45,6 +45,7 @@ pub struct CliOverrides {
     pub cache_dir: Option<String>,
     pub no_cache: bool,
     pub timeout: Option<String>,
+    pub max_retries: Option<String>,
     pub models_dir: Option<String>,
 }
 
@@ -63,6 +64,8 @@ pub struct ImgOcrConfig {
     pub cache_dir: Option<PathBuf>,
     pub cache_enabled: bool,
     pub timeout_secs: u64,
+    pub max_retries: u32,
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
     /// Where the local engine's `ocr_rec*.onnx` + dictionaries live.
     pub models_dir: PathBuf,
 }
@@ -175,6 +178,27 @@ impl ImgOcrConfig {
             None => 120,
         };
 
+        if timeout_secs == 0 {
+            return Err("--img-ocr-timeout must be positive".into());
+        }
+        let max_retries = cli
+            .max_retries
+            .or_else(|| env("DOCMILL_MAX_RETRIES"))
+            .map(|v| {
+                v.parse::<u32>().map_err(|_| {
+                    format!("--img-ocr-max-retries: {v:?} is not a non-negative integer")
+                })
+            })
+            .transpose()?
+            .unwrap_or(3);
+        let extra_body = match env("DOCMILL_EXTRA_BODY") {
+            Some(raw) => match serde_json::from_str(&raw) {
+                Ok(serde_json::Value::Object(map)) => map,
+                _ => return Err("DOCMILL_EXTRA_BODY must be a JSON object".into()),
+            },
+            None => Default::default(),
+        };
+
         let cache_dir = cli
             .cache_dir
             .map(PathBuf::from)
@@ -200,6 +224,8 @@ impl ImgOcrConfig {
             cache_dir,
             cache_enabled,
             timeout_secs,
+            max_retries,
+            extra_body,
             models_dir,
         })
     }
@@ -225,17 +251,23 @@ impl ImgOcrConfig {
                         "docmill: built without the local-ocr feature; skipping the local engine"
                     );
                 }
-                EngineKind::Vlm => chain.push(Box::new(OpenAiVlm::new(
-                    self.endpoint.clone().expect("validated in resolve"),
-                    self.model.clone().expect("validated in resolve"),
-                    self.prompt.clone(),
-                    self.api_key.clone(),
-                    self.timeout_secs,
-                ))),
-                EngineKind::Paddle => chain.push(Box::new(PaddleServer::new(
-                    self.endpoint.clone().expect("validated in resolve"),
-                    self.timeout_secs,
-                ))),
+                EngineKind::Vlm => chain.push(Box::new(
+                    OpenAiVlm::new(
+                        self.endpoint.clone().expect("validated in resolve"),
+                        self.model.clone().expect("validated in resolve"),
+                        self.prompt.clone(),
+                        self.api_key.clone(),
+                        self.timeout_secs,
+                    )
+                    .request_options(self.max_retries, self.extra_body.clone()),
+                )),
+                EngineKind::Paddle => chain.push(Box::new(
+                    PaddleServer::new(
+                        self.endpoint.clone().expect("validated in resolve"),
+                        self.timeout_secs,
+                    )
+                    .max_retries(self.max_retries),
+                )),
             }
         }
         if chain.is_empty() {

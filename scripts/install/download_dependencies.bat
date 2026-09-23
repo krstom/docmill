@@ -69,11 +69,13 @@ if exist .pdfium\lib\pdfium.dll if "%FORCE%"=="0" (
   rmdir .pdfium\bin 2>nul
   del .pdfium\pdfium.tgz
 )
+call :fetch_mirrored .models\ocr_det.onnx "%BASE_URL%/ocr_det.onnx" "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx" || echo warning: page detector unavailable; using region-scoped page OCR 1>&2
 call :fetch "%BASE_URL%/layout_heron.onnx" .models\layout_heron.onnx || goto fail
 call :fetch_opt "%BASE_URL%/layout_heron_int8.onnx" .models\layout_heron_int8.onnx
 
 if "%WITH_TF%"=="0" goto ocr_v3
 if not exist .models\tableformer mkdir .models\tableformer
+call :fetch_opt "%BASE_URL%/encoder_fp16.onnx" .models\tableformer\encoder_fp16.onnx
 call :fetch "%BASE_URL%/encoder.onnx" .models\tableformer\encoder.onnx || goto fail
 call :fetch_opt "%BASE_URL%/encoder.onnx.data" .models\tableformer\encoder.onnx.data
 call :fetch "%BASE_URL%/decoder.onnx" .models\tableformer\decoder.onnx || goto fail
@@ -87,8 +89,8 @@ call :fetch_opt "%BASE_URL%/bbox.onnx.data" .models\tableformer\bbox.onnx.data
 echo fetching PP-OCRv3 recognition pairs
 call :fetch "%BASE_URL%/ocr_rec.onnx" .models\ocr_rec.onnx || goto fail
 call :fetch "%BASE_URL%/ppocr_keys_v1.txt" .models\ppocr_keys_v1.txt || goto fail
-call :fetch "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" .models\ocr_rec_en.onnx || goto fail
-call :fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" .models\en_dict.txt || goto fail
+call :fetch_mirrored .models\ocr_rec_en.onnx "%BASE_URL%/ocr_rec_en.onnx" "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" || goto fail
+call :fetch_mirrored .models\en_dict.txt "%BASE_URL%/en_dict.txt" "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" || goto fail
 
 if "%WITH_V5%"=="0" goto done
 if exist .models\ppocrv5_mobile_det.onnx if exist .models\ppocrv5_mobile_rec.onnx if "%FORCE%"=="0" (
@@ -134,8 +136,14 @@ curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 2 -o "%~2.download" %1 |
 move /y "%~2.download" %2 >nul
 exit /b 0
 
+:fetch_mirrored
+if exist %1 if "%FORCE%"=="0" exit /b 0
+call :fetch %2 %1 && exit /b 0
+call :fetch %3 %1
+exit /b %errorlevel%
+
 :fetch_opt
-if exist %2 exit /b 0
+if exist %2 if "%FORCE%"=="0" exit /b 0
 curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 2 -o "%~2.download" %1 >nul 2>nul
 if errorlevel 1 (
   del "%~2.download" 2>nul

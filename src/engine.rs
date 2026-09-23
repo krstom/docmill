@@ -18,7 +18,10 @@ pub mod det;
 #[cfg(feature = "local-ocr")]
 pub mod local;
 pub mod paddle;
+mod remote;
 pub mod vlm;
+
+use std::time::{Duration, Instant};
 
 use crate::cache::{now_unix, CachedOcr, OcrCache};
 
@@ -54,7 +57,7 @@ impl OcrText {
 }
 
 /// One OCR backend. `cache_salt` must fold in every parameter that changes
-/// the engine's output (model paths, endpoint, prompt), so cache entries
+/// the engine's output (model content, endpoint, request), so cache entries
 /// can't outlive a config change. `Send` so a serve worker thread can own
 /// the runner (every real engine is: ort sessions and ureq agents are Send).
 pub trait OcrEngine: Send {
@@ -80,14 +83,15 @@ struct Slot {
     engine: Box<dyn OcrEngine>,
     dead: bool,
     consecutive_failures: u32,
+    retry_at: Option<Instant>,
 }
 
-/// Drives the ordered engine chain through the cache: per image, the first
-/// cache hit (in chain order) wins; on a full miss, the first engine that
-/// returns `Ok` — including an empty string — wins and is cached.
+/// Tries each engine in configured order: cache first, then a live attempt.
+/// A cached fallback never bypasses a healthy preferred engine.
 pub struct OcrRunner {
     slots: Vec<Slot>,
     cache: OcrCache,
+    cooldown: Option<Duration>,
 }
 
 impl OcrRunner {
@@ -99,20 +103,42 @@ impl OcrRunner {
                     engine,
                     dead: false,
                     consecutive_failures: 0,
+                    retry_at: None,
                 })
                 .collect(),
             cache,
+            cooldown: None,
         }
+    }
+
+    /// Service runners periodically probe transiently unavailable engines.
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = Some(cooldown);
+        self
     }
 
     /// OCR one image. `None` means every engine failed (or was dead) — the
     /// caller leaves the picture untouched.
     pub fn run(&mut self, bytes: &[u8], mimetype: &str) -> Option<OcrOutcome> {
-        // Cache pass first, in chain order: a hit for the *first* configured
-        // engine must win even if a later engine also has one, so the chain
-        // order stays meaningful across runs.
-        for slot in &self.slots {
-            let key = OcrCache::key(slot.engine.id(), &slot.engine.cache_salt(), bytes);
+        self.run_with_clock(bytes, mimetype, Instant::now)
+    }
+
+    #[cfg(test)]
+    fn run_at(&mut self, bytes: &[u8], mimetype: &str, now: Instant) -> Option<OcrOutcome> {
+        self.run_with_clock(bytes, mimetype, || now)
+    }
+
+    fn run_with_clock(
+        &mut self,
+        bytes: &[u8],
+        mimetype: &str,
+        mut now: impl FnMut() -> Instant,
+    ) -> Option<OcrOutcome> {
+        for slot in &mut self.slots {
+            let salt = crate::cache::canonical_json(
+                serde_json::json!({"engine": slot.engine.cache_salt(), "mimetype": mimetype}),
+            );
+            let key = OcrCache::key(slot.engine.id(), &salt, bytes);
             if let Some(hit) = self.cache.get(&key) {
                 return Some(OcrOutcome {
                     text: hit.text,
@@ -121,16 +147,14 @@ impl OcrRunner {
                     from_cache: true,
                 });
             }
-        }
-        for slot in &mut self.slots {
-            if slot.dead {
+            if slot.dead || slot.retry_at.is_some_and(|deadline| now() < deadline) {
                 continue;
             }
+            slot.retry_at = None;
             let id = slot.engine.id();
             match slot.engine.ocr(bytes, mimetype) {
                 Ok(out) => {
                     slot.consecutive_failures = 0;
-                    let key = OcrCache::key(id, &slot.engine.cache_salt(), bytes);
                     self.cache.put(
                         &key,
                         &CachedOcr {
@@ -157,12 +181,22 @@ impl OcrRunner {
                 Err(fail @ OcrFailure::Transient(_)) => {
                     slot.consecutive_failures += 1;
                     if slot.consecutive_failures >= DEAD_AFTER {
-                        eprintln!(
-                            "docmill: {id}: {} — {DEAD_AFTER} consecutive failures, disabling \
-                             this engine for the run",
-                            fail.message()
-                        );
-                        slot.dead = true;
+                        if let Some(cooldown) = self.cooldown {
+                            // Start after the failed request, which can itself
+                            // take longer than the entire cooldown interval.
+                            slot.retry_at = Some(now() + cooldown);
+                            eprintln!(
+                                "docmill: {id}: {} — retrying after {}s cooldown",
+                                fail.message(),
+                                cooldown.as_secs()
+                            );
+                        } else {
+                            slot.dead = true;
+                            eprintln!(
+                                "docmill: {id}: {} — disabling this engine for the run",
+                                fail.message()
+                            );
+                        }
                     } else {
                         eprintln!("docmill: {id}: {}", fail.message());
                     }
@@ -282,9 +316,14 @@ pub(crate) mod tests {
         let (a, a_calls) = MockEngine::new("a", responses);
         let mut runner = runner_with(vec![Box::new(a)], dir.path());
         for i in 0..5 {
-            assert!(runner.run(format!("img{i}").as_bytes(), "image/png").is_none());
+            assert!(runner
+                .run(format!("img{i}").as_bytes(), "image/png")
+                .is_none());
         }
-        assert_eq!(a_calls.load(std::sync::atomic::Ordering::SeqCst), DEAD_AFTER as usize);
+        assert_eq!(
+            a_calls.load(std::sync::atomic::Ordering::SeqCst),
+            DEAD_AFTER as usize
+        );
     }
 
     #[test]
@@ -301,5 +340,45 @@ pub(crate) mod tests {
         let out2 = runner.run(b"logo", "image/png").unwrap();
         assert!(out2.from_cache);
         assert_eq!(a_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn preferred_engine_recovers_before_a_cached_fallback_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut responses = (0..3)
+            .map(|_| Err(OcrFailure::Transient("down".into())))
+            .collect::<Vec<_>>();
+        responses.push(Ok("preferred".into()));
+        let (a, calls) = MockEngine::new("a", responses);
+        let (b, b_calls) = MockEngine::new("b", vec![Ok("fallback".into())]);
+        let mut runner = runner_with(vec![Box::new(a), Box::new(b)], dir.path())
+            .with_cooldown(Duration::from_secs(30));
+        let now = Instant::now();
+        for _ in 0..4 {
+            assert_eq!(
+                runner.run_at(b"same", "image/png", now).unwrap().text,
+                "fallback"
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(b_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            runner
+                .run_at(b"same", "image/png", now + Duration::from_secs(30))
+                .unwrap()
+                .text,
+            "preferred"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn mime_type_participates_in_cache_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, calls) = MockEngine::new("a", vec![]);
+        let mut runner = runner_with(vec![Box::new(a)], dir.path());
+        runner.run(b"same", "image/png").unwrap();
+        assert!(runner.run(b"same", "image/png").unwrap().from_cache);
+        assert!(!runner.run(b"same", "image/jpeg").unwrap().from_cache);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

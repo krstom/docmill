@@ -35,8 +35,35 @@ use crate::layout::{self, Span};
 /// Which model files this engine resolved to.
 #[derive(Debug, Clone)]
 enum Models {
-    V5 { det: PathBuf, rec: PathBuf, dict: PathBuf },
-    V3 { rec: PathBuf, dict: PathBuf },
+    V5 {
+        det: PathBuf,
+        rec: PathBuf,
+        dict: PathBuf,
+    },
+    V3 {
+        rec: PathBuf,
+        dict: PathBuf,
+    },
+}
+
+fn model_identity(models: &Models, lang: &str) -> String {
+    let digest = |path: &Path| {
+        let main = crate::cache::file_digest(path).ok();
+        // paddle2onnx may emit external tensors alongside the graph.
+        let sidecar = path.with_file_name(format!(
+            "{}.data",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        serde_json::json!({"model": main, "external_data": crate::cache::file_digest(&sidecar).ok()})
+    };
+    crate::cache::canonical_json(match models {
+        Models::V5 { det, rec, dict } => {
+            serde_json::json!({"generation": "v5", "det": digest(det), "rec": digest(rec), "dict": digest(dict)})
+        }
+        Models::V3 { rec, dict } => {
+            serde_json::json!({"generation": "v3", "lang": lang, "rec": digest(rec), "dict": digest(dict)})
+        }
+    })
 }
 
 struct Ready {
@@ -56,6 +83,7 @@ enum State {
 }
 
 pub struct LocalPpocr {
+    cache_identity: std::sync::OnceLock<String>,
     lang: String,
     models: Models,
     state: State,
@@ -69,9 +97,11 @@ impl LocalPpocr {
     /// `DOCLING_OCR_REC_ONNX`/`DOCLING_OCR_DICT` the v3 pair (same contract
     /// as docling-pdf itself). `lang` (`en`/`ch`) applies to v3 only.
     pub fn new(lang: &str, models_dir: &Path) -> Self {
+        let models = resolve_models(lang, models_dir);
         Self {
+            models,
+            cache_identity: std::sync::OnceLock::new(),
             lang: lang.to_string(),
-            models: resolve_models(lang, models_dir),
             state: State::Unloaded,
         }
     }
@@ -106,7 +136,12 @@ impl LocalPpocr {
 
 /// Pick v5 (env triple, else on-disk triple) or fall back to the v3 pair.
 fn resolve_models(lang: &str, models_dir: &Path) -> Models {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).map(PathBuf::from);
+    let env = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+    };
     let explicit = match (
         env("DOCMILL_DET_ONNX"),
         env("DOCMILL_REC_ONNX"),
@@ -132,7 +167,11 @@ fn resolve_models_with_override(
         models_dir.join("ppocrv5_dict.txt"),
     );
     if v5.0.exists() && v5.1.exists() && v5.2.exists() {
-        return Models::V5 { det: v5.0, rec: v5.1, dict: v5.2 };
+        return Models::V5 {
+            det: v5.0,
+            rec: v5.1,
+            dict: v5.2,
+        };
     }
     let (rec, dict) = resolve_rec_pair(lang, models_dir);
     Models::V3 { rec, dict }
@@ -160,8 +199,12 @@ fn resolve_rec_pair(lang: &str, models_dir: &Path) -> (PathBuf, PathBuf) {
         }
     }
     (
-        std::env::var("DOCLING_OCR_REC_ONNX").map(PathBuf::from).unwrap_or(onnx),
-        std::env::var("DOCLING_OCR_DICT").map(PathBuf::from).unwrap_or(dict),
+        std::env::var("DOCLING_OCR_REC_ONNX")
+            .map(PathBuf::from)
+            .unwrap_or(onnx),
+        std::env::var("DOCLING_OCR_DICT")
+            .map(PathBuf::from)
+            .unwrap_or(dict),
     )
 }
 
@@ -177,7 +220,11 @@ fn to_bgr(mut img: RgbImage) -> RgbImage {
 
 /// Recognize prepared line crops with deterministic same-width batching —
 /// shared by both model generations.
-fn recognize(rec: &mut Session, chars: &[String], lines: &[PrepLine]) -> Result<Vec<String>, String> {
+fn recognize(
+    rec: &mut Session,
+    chars: &[String],
+    lines: &[PrepLine],
+) -> Result<Vec<String>, String> {
     let mut texts = vec![String::new(); lines.len()];
     for (w, chunk) in width_batches(lines) {
         let data = batch_input(w, &chunk, lines);
@@ -204,18 +251,11 @@ impl OcrEngine for LocalPpocr {
     }
 
     fn cache_salt(&self) -> String {
-        // Model identity — a different generation, file set, or (v3) language
-        // must invalidate cached text.
-        match &self.models {
-            // "v5g" (not "v5"): the payload gained the grid rendering, so
-            // pre-grid cache entries must miss rather than serve gridless.
-            Models::V5 { det, rec, dict } => {
-                format!("v5g|{}|{}|{}", det.display(), rec.display(), dict.display())
-            }
-            Models::V3 { rec, dict } => {
-                format!("{}|{}|{}", self.lang, rec.display(), dict.display())
-            }
-        }
+        // A text-only document never needs model fingerprints. Resolve paths
+        // at construction, but hash only on the first picture cache lookup.
+        self.cache_identity
+            .get_or_init(|| model_identity(&self.models, &self.lang))
+            .clone()
     }
 
     fn ocr(&mut self, bytes: &[u8], _mimetype: &str) -> Result<OcrText, OcrFailure> {
@@ -261,7 +301,8 @@ impl OcrEngine for LocalPpocr {
                 if x1 <= x0 + 2 || y1 <= y0 + 2 {
                     continue;
                 }
-                let crop = to_bgr(image::imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image());
+                let crop =
+                    to_bgr(image::imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image());
                 if let Some(pl) = prep_line(&crop) {
                     rects.push((x0 as f32, y0 as f32, x1 as f32, y1 as f32));
                     lines.push(pl);
@@ -280,7 +321,11 @@ impl OcrEngine for LocalPpocr {
                     b,
                 })
                 .collect();
-            let plain = spans.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n");
+            let plain = spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             let grid = (!spans.is_empty()).then(|| layout::grid(&spans));
             Ok(OcrText { text: plain, grid })
         } else {
@@ -304,6 +349,51 @@ impl OcrEngine for LocalPpocr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replaced_models_dictionaries_and_external_tensors_invalidate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("rec.onnx");
+        let dict = dir.path().join("dict.txt");
+        let sidecar = dir.path().join("rec.onnx.data");
+        std::fs::write(&rec, b"aaaa").unwrap();
+        std::fs::write(&dict, b"A\nB\n").unwrap();
+        let models = Models::V3 {
+            rec: rec.clone(),
+            dict: dict.clone(),
+        };
+        let first = model_identity(&models, "en");
+        std::fs::write(&rec, b"bbbb").unwrap();
+        let replaced = model_identity(&models, "en");
+        assert_ne!(first, replaced);
+        std::fs::write(&dict, b"C\nD\n").unwrap();
+        let dictionary = model_identity(&models, "en");
+        assert_ne!(replaced, dictionary);
+        std::fs::write(&sidecar, b"weights").unwrap();
+        assert_ne!(dictionary, model_identity(&models, "en"));
+    }
+
+    #[test]
+    fn local_identity_is_computed_lazily_and_frozen_per_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("rec.onnx");
+        std::fs::write(&model, b"before").unwrap();
+        let engine = LocalPpocr {
+            cache_identity: Default::default(),
+            lang: "en".into(),
+            models: Models::V3 {
+                rec: model.clone(),
+                dict: dir.path().join("dict.txt"),
+            },
+            state: State::Unloaded,
+        };
+        assert!(engine.cache_identity.get().is_none());
+        let first = engine.cache_salt();
+        assert!(engine.cache_identity.get().is_some());
+        std::fs::write(&model, b"after!").unwrap();
+        assert_eq!(first, engine.cache_salt());
+        assert_ne!(first, model_identity(&engine.models, "en"));
+    }
 
     #[test]
     fn complete_v5_triple_is_preferred_in_models_dir() {

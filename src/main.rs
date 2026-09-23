@@ -60,6 +60,7 @@ use std::process::ExitCode;
 use docling::{DocumentConverter, ImageMode, InputFormat, SourceDocument};
 use docling_core::DoclingDocument;
 use docmill::config::{CliOverrides, ImgOcrConfig};
+use docmill::conversion::{normalize_ocr_lang, ConversionOptions, WarmPipeline};
 use docmill::input::DetectedSource;
 use docmill::postprocess::{self, one_picture_document, OutputMode, PostOptions};
 
@@ -96,7 +97,13 @@ Conversion (same semantics as docling-rs):
                               (for text layers that lie)
   --no-text-panels            keep every detected picture as a picture —
                               disable the text-panel-to-paragraphs demotion
-  --ocr-lang en|ch            the PDF pipeline's own page-OCR language
+  --skip-ocr                  keep layout/tables/pictures; skip page recognition
+  --ocr-mode MODE             default|full_page|layout_regions|pdf_aware_layout_regions
+  --ocr-scale SCALE           positive OCR pixels per PDF point
+  --heading-hierarchy         infer PDF heading levels
+  --encoding NAME             explicit encoding for text input
+  --page-break-placeholder TEXT  text inserted between Markdown pages
+  --ocr-lang TAG              English/Chinese page-OCR language (e.g. en-US, zh-Hant)
   --asr-model PRESET          Whisper preset for audio inputs
   --asr-lang CODE             Whisper language code or auto (default)
   --video-frames N            max frames sampled from a video input
@@ -131,6 +138,7 @@ Picture OCR (flag > DOCMILL_* env var > default):
   --img-ocr-cache-dir DIR     OCR result cache (default ~/.cache/docmill)
   --no-img-ocr-cache          disable the cache for this run
   --img-ocr-timeout SECS      remote request timeout (default 120)
+  --img-ocr-max-retries N     retries after transient errors (default 3)
   --img-ocr-models-dir DIR    local models dir (default: ./.models, else next to
                               the installed binary)
 
@@ -151,6 +159,7 @@ fn main() -> ExitCode {
         }
     }
 
+    let mut conversion = ConversionOptions::default();
     let mut strict = false;
     let mut to = "md".to_string();
     let mut output: Option<String> = None;
@@ -190,6 +199,16 @@ fn main() -> ExitCode {
             "-V" | "--version" => {
                 println!("docmill {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
+            }
+            "--skip-ocr"
+            | "--heading-hierarchy"
+            | "--ocr-mode"
+            | "--ocr-scale"
+            | "--encoding"
+            | "--page-break-placeholder" => {
+                if let Err(e) = conversion.parse_flag(&arg, &mut args) {
+                    return usage_error(&e);
+                }
             }
             "--strict" => strict = true,
             "--fetch-images" => fetch_images = true,
@@ -241,8 +260,10 @@ fn main() -> ExitCode {
                 None => return usage_error("--pages needs a range like 1-10"),
             },
             "--ocr-lang" => match args.next() {
-                Some(v) if matches!(v.trim(), "en" | "ch") => ocr_lang = Some(v),
-                Some(v) => return usage_error(&format!("--ocr-lang {v:?} is not en|ch")),
+                Some(v) => match normalize_ocr_lang(&v) {
+                    Ok(lang) => ocr_lang = Some(lang),
+                    Err(e) => return usage_error(&e),
+                },
                 None => return usage_error("--ocr-lang needs a value (en|ch)"),
             },
             "--img-ocr-engine" => cli.engine = args.next(),
@@ -256,6 +277,12 @@ fn main() -> ExitCode {
             "--img-ocr-cache-dir" => cli.cache_dir = args.next(),
             "--no-img-ocr-cache" => cli.no_cache = true,
             "--img-ocr-timeout" => cli.timeout = args.next(),
+            "--img-ocr-max-retries" => {
+                cli.max_retries = Some(match args.next() {
+                    Some(v) => v,
+                    None => return usage_error("--img-ocr-max-retries needs a value"),
+                })
+            }
             "--img-ocr-models-dir" => cli.models_dir = args.next(),
             _ if arg.starts_with("--") => {
                 return usage_error(&format!("unknown flag '{arg}' (try --help)"))
@@ -278,6 +305,25 @@ fn main() -> ExitCode {
                 "unknown --images '{other}' (expected: placeholder, embedded, referenced)"
             ))
         }
+    };
+
+    let conversion = ConversionOptions {
+        strict,
+        fetch_images,
+        no_table_former,
+        no_ocr,
+        force_full_page_ocr,
+        no_text_panels,
+        use_web_browser,
+        enrich_picture_classes,
+        enrich_code,
+        enrich_formula,
+        asr_model: asr_model.clone(),
+        asr_lang: asr_lang.clone(),
+        video_frames,
+        pages,
+        ocr_lang: ocr_lang.clone(),
+        ..conversion
     };
 
     if let Some(pattern) = input {
@@ -318,21 +364,7 @@ fn main() -> ExitCode {
         let batch = BatchCfg {
             to,
             image_mode,
-            strict,
-            fetch_images,
-            no_table_former,
-            no_ocr,
-            force_full_page_ocr,
-            no_text_panels,
-            use_web_browser,
-            enrich_picture_classes,
-            enrich_code,
-            enrich_formula,
-            asr_model,
-            asr_lang,
-            video_frames,
-            pages,
-            ocr_lang,
+            conversion,
             picture_ocr: cfg,
             #[cfg(feature = "vlm")]
             vlm,
@@ -365,7 +397,7 @@ fn main() -> ExitCode {
 
     if let Some(runs) = bench_warm {
         let source = SourceDocument::from_bytes(source.name, source.format, source.bytes);
-        return bench_warm_conversion(&source, runs, no_table_former, no_ocr);
+        return bench_warm_conversion(&source, runs, &conversion);
     }
 
     let run_ocr = cfg.mode != OutputMode::Placeholder;
@@ -384,7 +416,7 @@ fn main() -> ExitCode {
             vlm_endpoint,
             vlm_model,
             pages,
-            strict,
+            &conversion,
             &cfg,
             run_ocr,
             &to,
@@ -403,28 +435,7 @@ fn main() -> ExitCode {
         if bypass {
             one_picture_document(&source.name, source.bytes, strict)
         } else {
-            let mut converter = DocumentConverter::new()
-                .strict(strict)
-                .asr_model(asr_model.clone())
-                .asr_lang(asr_lang.clone())
-                .fetch_images(fetch_images)
-                .no_table_former(no_table_former)
-                .no_ocr(no_ocr)
-                .force_full_page_ocr(force_full_page_ocr)
-                .no_text_panels(no_text_panels)
-                .use_web_browser(use_web_browser)
-                .do_picture_classification(enrich_picture_classes)
-                .do_code_enrichment(enrich_code)
-                .do_formula_enrichment(enrich_formula);
-            if let Some(max) = video_frames {
-                converter = converter.video_frames(max);
-            }
-            if let Some((first, last)) = pages {
-                converter = converter.page_range(first, last);
-            }
-            if let Some(lang) = &ocr_lang {
-                converter = converter.ocr_lang(lang.clone());
-            }
+            let converter = conversion.converter();
             #[cfg(feature = "pdf")]
             {
                 let is_markdown = matches!(to.as_str(), "md" | "markdown");
@@ -444,6 +455,7 @@ fn main() -> ExitCode {
         }
     };
 
+    conversion.finish_document(&mut document);
     if run_ocr {
         let mut runner = match cfg.build_runner() {
             Ok(r) => r,
@@ -453,7 +465,7 @@ fn main() -> ExitCode {
             mode: cfg.mode,
             min_pixels: cfg.min_pixels,
             keep_picture: image_mode != ImageMode::Placeholder,
-            ocr_hidden: to == "dclx",
+            target: postprocess::OutputTarget::from_format(&to),
         };
         let stats = postprocess::apply(&mut document, &mut runner, &opts);
         eprintln!("{stats}");
@@ -518,7 +530,7 @@ fn run_vlm_pipeline(
     vlm_endpoint: Option<String>,
     vlm_model: Option<String>,
     pages: Option<(usize, usize)>,
-    strict: bool,
+    conversion: &ConversionOptions,
     cfg: &ImgOcrConfig,
     run_ocr: bool,
     to: &str,
@@ -540,7 +552,7 @@ fn run_vlm_pipeline(
                 return ExitCode::FAILURE;
             }
         };
-        document.strict_markdown = strict;
+        conversion.finish_document(&mut document);
         if run_ocr {
             match cfg.build_runner() {
                 Ok(mut runner) => {
@@ -548,7 +560,7 @@ fn run_vlm_pipeline(
                         mode: cfg.mode,
                         min_pixels: cfg.min_pixels,
                         keep_picture: image_mode != ImageMode::Placeholder,
-                        ocr_hidden: to == "dclx",
+                        target: postprocess::OutputTarget::from_format(&to),
                     };
                     let stats = postprocess::apply(&mut document, &mut runner, &opts);
                     eprintln!("{stats}");
@@ -565,7 +577,7 @@ fn run_vlm_pipeline(
             vlm_endpoint,
             vlm_model,
             pages,
-            strict,
+            conversion,
             cfg,
             run_ocr,
             to,
@@ -582,30 +594,28 @@ fn run_vlm_pipeline(
 fn bench_warm_conversion(
     source: &SourceDocument,
     runs: usize,
-    no_table_former: bool,
-    no_ocr: bool,
+    options: &ConversionOptions,
 ) -> ExitCode {
     #[cfg(feature = "pdf")]
     {
         let result = (|| -> Result<f64, String> {
-            let mut pipeline = docling::Pipeline::new()
-                .map_err(|e| e.to_string())?
-                .no_table_former(no_table_former)
-                .no_ocr(no_ocr);
-            let once = |p: &mut docling::Pipeline| -> Result<(), String> {
-                match source.format {
-                    InputFormat::Pdf => p
-                        .convert(&source.bytes, None, &source.name)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                    InputFormat::Image => p
-                        .convert_image(&source.bytes, &source.name)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                    other => Err(format!(
-                        "--bench-warm supports PDF/image only, not {other:?}"
-                    )),
-                }
+            if !matches!(source.format, InputFormat::Pdf | InputFormat::Image) {
+                return Err(format!(
+                    "--bench-warm supports PDF/image only, not {:?}",
+                    source.format
+                ));
+            }
+            let mut pipeline = WarmPipeline::default();
+            let once = |p: &mut WarmPipeline| -> Result<(), String> {
+                p.convert(
+                    SourceDocument::from_bytes(
+                        source.name.clone(),
+                        source.format,
+                        source.bytes.clone(),
+                    ),
+                    options,
+                )
+                .map(|_| ())
             };
             once(&mut pipeline)?; // warm-up: load models, prime caches
             let mut total = 0.0f64;
@@ -630,7 +640,7 @@ fn bench_warm_conversion(
     }
     #[cfg(not(feature = "pdf"))]
     {
-        let _ = (source, runs, no_table_former, no_ocr);
+        let _ = (source, runs, options);
         usage_error("--bench-warm needs the pdf feature")
     }
 }
@@ -650,21 +660,7 @@ fn chunks_json(document: &DoclingDocument) -> String {
 struct BatchCfg {
     to: String,
     image_mode: ImageMode,
-    strict: bool,
-    fetch_images: bool,
-    no_table_former: bool,
-    no_ocr: bool,
-    force_full_page_ocr: bool,
-    no_text_panels: bool,
-    use_web_browser: bool,
-    enrich_picture_classes: bool,
-    enrich_code: bool,
-    enrich_formula: bool,
-    asr_model: Option<String>,
-    asr_lang: Option<String>,
-    video_frames: Option<usize>,
-    pages: Option<(usize, usize)>,
-    ocr_lang: Option<String>,
+    conversion: ConversionOptions,
     picture_ocr: ImgOcrConfig,
     #[cfg(feature = "vlm")]
     vlm: Option<docling::vlm::VlmOptions>,
@@ -672,9 +668,7 @@ struct BatchCfg {
 
 /// Expand a glob or recursively sweep a directory, returning the files and
 /// the static base path used to preserve their relative output layout.
-fn expand_glob(
-    pattern: &str,
-) -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), String> {
+fn expand_glob(pattern: &str) -> Result<(Vec<std::path::PathBuf>, std::path::PathBuf), String> {
     let dir = Path::new(pattern);
     if dir.is_dir() {
         let mut files = Vec::new();
@@ -735,12 +729,7 @@ fn glob_base(pattern: &str) -> std::path::PathBuf {
     base
 }
 
-fn batch_out_path(
-    file: &Path,
-    base: &Path,
-    output: &Path,
-    to: &str,
-) -> std::path::PathBuf {
+fn batch_out_path(file: &Path, base: &Path, output: &Path, to: &str) -> std::path::PathBuf {
     let relative = file
         .strip_prefix(base)
         .map(Path::to_path_buf)
@@ -755,64 +744,10 @@ fn batch_out_path(
 }
 
 fn batch_converter(cfg: &BatchCfg) -> DocumentConverter {
-    let mut converter = DocumentConverter::new()
-        .strict(cfg.strict)
-        .asr_model(cfg.asr_model.clone())
-        .asr_lang(cfg.asr_lang.clone())
-        .fetch_images(cfg.fetch_images)
-        .no_table_former(cfg.no_table_former)
-        .no_ocr(cfg.no_ocr)
-        .force_full_page_ocr(cfg.force_full_page_ocr)
-        .no_text_panels(cfg.no_text_panels)
-        .use_web_browser(cfg.use_web_browser)
-        .do_picture_classification(cfg.enrich_picture_classes)
-        .do_code_enrichment(cfg.enrich_code)
-        .do_formula_enrichment(cfg.enrich_formula);
-    if let Some(max) = cfg.video_frames {
-        converter = converter.video_frames(max);
-    }
-    if let Some((first, last)) = cfg.pages {
-        converter = converter.page_range(first, last);
-    }
-    if let Some(lang) = &cfg.ocr_lang {
-        converter = converter.ocr_lang(lang.clone());
-    }
-    converter
+    cfg.conversion.converter()
 }
 
-#[cfg(feature = "pdf")]
-type SharedBatchPipeline = std::sync::Mutex<Option<docling::Pipeline>>;
-
-#[cfg(not(feature = "pdf"))]
-struct SharedBatchPipeline;
-
-#[cfg(feature = "pdf")]
-fn batch_pipeline<'a>(
-    slot: &'a mut Option<docling::Pipeline>,
-    cfg: &BatchCfg,
-) -> Result<&'a mut docling::Pipeline, String> {
-    if slot.is_none() {
-        let mut pipeline = docling::Pipeline::new()
-            .map_err(|e| e.to_string())?
-            .no_table_former(cfg.no_table_former)
-            .no_ocr(cfg.no_ocr)
-            .force_full_page_ocr(cfg.force_full_page_ocr)
-            .no_text_panels(cfg.no_text_panels)
-            .enrichments(docling::EnrichmentOptions {
-                picture_classification: cfg.enrich_picture_classes,
-                code: cfg.enrich_code,
-                formula: cfg.enrich_formula,
-            });
-        pipeline.set_pages(cfg.pages);
-        pipeline.set_ocr_lang(match cfg.ocr_lang.as_deref() {
-            Some("ch") => Some(docling::OcrLang::Ch),
-            Some(_) => Some(docling::OcrLang::En),
-            None => None,
-        });
-        *slot = Some(pipeline);
-    }
-    Ok(slot.as_mut().expect("pipeline initialized"))
-}
+type SharedBatchPipeline = std::sync::Mutex<WarmPipeline>;
 
 fn batch_convert_one(
     file: &Path,
@@ -827,7 +762,7 @@ fn batch_convert_one(
     if let Some(warning) = &source.warning {
         eprintln!("warning: {}: {warning}", file.display());
     }
-    let page_count = batch_page_count(&source, cfg.pages);
+    let page_count = batch_page_count(&source, cfg.conversion.pages);
     match page_count {
         Some(1) => eprintln!("start: {} (1 page)", file.display()),
         Some(n) => eprintln!("start: {} ({n} pages)", file.display()),
@@ -841,18 +776,18 @@ fn batch_convert_one(
         && cfg.picture_ocr.remote_first()
         && format == InputFormat::Image
     {
-        one_picture_document(&source.name, source.bytes, cfg.strict)
+        one_picture_document(&source.name, source.bytes, cfg.conversion.strict)
     } else {
         batch_convert_source(source, converter, cfg, shared_pipeline)?
     };
-    document.strict_markdown = cfg.strict;
+    cfg.conversion.finish_document(&mut document);
 
     if let Some(runner) = runner {
         let options = PostOptions {
             mode: cfg.picture_ocr.mode,
             min_pixels: cfg.picture_ocr.min_pixels,
             keep_picture: cfg.image_mode != ImageMode::Placeholder,
-            ocr_hidden: cfg.to == "dclx",
+            target: postprocess::OutputTarget::from_format(&cfg.to),
         };
         let stats = postprocess::apply(&mut document, runner, &options);
         eprintln!("{}: {stats}", file.display());
@@ -879,10 +814,12 @@ fn batch_page_count(source: &DetectedSource, pages: Option<(usize, usize)>) -> O
     #[cfg(feature = "pdf")]
     {
         if source.format == InputFormat::Pdf {
-            return docling::pdf_page_count(&source.bytes, None).ok().map(|total| match pages {
-                Some((first, last)) => (last.min(total) + 1).saturating_sub(first).min(total),
-                None => total,
-            });
+            return docling::pdf_page_count(&source.bytes, None)
+                .ok()
+                .map(|total| match pages {
+                    Some((first, last)) => (last.min(total) + 1).saturating_sub(first).min(total),
+                    None => total,
+                });
         }
     }
     #[cfg(not(feature = "pdf"))]
@@ -900,23 +837,14 @@ fn batch_convert_source(
     let _ = cfg;
     #[cfg(feature = "vlm")]
     if let Some(vlm) = &cfg.vlm {
-        return docling::vlm::convert_vlm(&source.into_docling(), vlm)
-            .map_err(|e| e.to_string());
+        return docling::vlm::convert_vlm(&source.into_docling(), vlm).map_err(|e| e.to_string());
     }
 
     #[cfg(feature = "pdf")]
     if matches!(source.format, InputFormat::Pdf | InputFormat::Image) {
-        let mut guard = shared_pipeline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let pipeline = batch_pipeline(&mut guard, cfg)?;
-        return match source.format {
-            InputFormat::Pdf => pipeline.convert(&source.bytes, None, &source.name),
-            _ => pipeline.convert_image(&source.bytes, &source.name),
-        }
-        .map_err(|e| e.to_string());
+        let mut guard = shared_pipeline.lock().unwrap_or_else(|p| p.into_inner());
+        return guard.convert(source.into_docling(), &cfg.conversion);
     }
-
     #[cfg(not(feature = "pdf"))]
     let _ = shared_pipeline;
     converter
@@ -931,8 +859,7 @@ fn write_batch_document(
     out: &Path,
 ) -> Result<(), String> {
     if let Some(dir) = out.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     }
     match cfg.to.as_str() {
         "json" => std::fs::write(out, document.export_to_json())
@@ -962,8 +889,7 @@ fn write_batch_document(
                 std::fs::write(&target, bytes)
                     .map_err(|e| format!("writing {}: {e}", target.display()))?;
             }
-            std::fs::write(out, markdown)
-                .map_err(|e| format!("writing {}: {e}", out.display()))
+            std::fs::write(out, markdown).map_err(|e| format!("writing {}: {e}", out.display()))
         }
     }
 }
@@ -989,9 +915,9 @@ fn run_batch(
     let succeeded = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
     #[cfg(feature = "pdf")]
-    let shared_pipeline = std::sync::Mutex::new(None);
+    let shared_pipeline = std::sync::Mutex::new(WarmPipeline::default());
     #[cfg(not(feature = "pdf"))]
-    let shared_pipeline = SharedBatchPipeline;
+    let shared_pipeline = SharedBatchPipeline::default();
     let workers = jobs.min(files.len()).max(1);
 
     std::thread::scope(|scope| {
@@ -1077,9 +1003,30 @@ fn run_serve(args: Vec<String>) -> ExitCode {
     {
         let mut addr = "127.0.0.1:8877".to_string();
         let mut cli = CliOverrides::default();
+        let mut conversion = ConversionOptions::default();
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
+                "--skip-ocr"
+                | "--heading-hierarchy"
+                | "--ocr-mode"
+                | "--ocr-scale"
+                | "--encoding"
+                | "--page-break-placeholder" => {
+                    if let Err(e) = conversion.parse_flag(&arg, &mut it) {
+                        return usage_error(&e);
+                    }
+                }
+                "--no-ocr" => conversion.no_ocr = true,
+                "--no-table-former" => conversion.no_table_former = true,
+                "--force-full-page-ocr" => conversion.force_full_page_ocr = true,
+                "--no-text-panels" => conversion.no_text_panels = true,
+                "--strict" => conversion.strict = true,
+                "--ocr-lang" => match it.next().map(|v| normalize_ocr_lang(&v)) {
+                    Some(Ok(lang)) => conversion.ocr_lang = Some(lang),
+                    Some(Err(e)) => return usage_error(&e),
+                    None => return usage_error("--ocr-lang needs a language tag"),
+                },
                 "--addr" => match it.next() {
                     Some(v) => addr = v,
                     None => return usage_error("--addr needs HOST:PORT"),
@@ -1095,6 +1042,12 @@ fn run_serve(args: Vec<String>) -> ExitCode {
                 "--img-ocr-cache-dir" => cli.cache_dir = it.next(),
                 "--no-img-ocr-cache" => cli.no_cache = true,
                 "--img-ocr-timeout" => cli.timeout = it.next(),
+                "--img-ocr-max-retries" => {
+                    cli.max_retries = Some(match it.next() {
+                        Some(v) => v,
+                        None => return usage_error("--img-ocr-max-retries needs a value"),
+                    })
+                }
                 "--img-ocr-models-dir" => cli.models_dir = it.next(),
                 other => {
                     eprintln!("error: unknown serve argument '{other}'");
@@ -1107,7 +1060,11 @@ fn run_serve(args: Vec<String>) -> ExitCode {
             Ok(cfg) => cfg,
             Err(e) => return usage_error(&e),
         };
-        match docmill::serve::serve(docmill::serve::ServeConfig { addr, cfg }) {
+        match docmill::serve::serve(docmill::serve::ServeConfig {
+            addr,
+            cfg,
+            conversion,
+        }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1206,10 +1163,7 @@ mod tests {
     #[test]
     fn glob_base_is_the_static_prefix() {
         assert_eq!(glob_base("reports/**/*.pdf"), Path::new("reports"));
-        assert_eq!(
-            glob_base("reports/one.pdf"),
-            Path::new("reports")
-        );
+        assert_eq!(glob_base("reports/one.pdf"), Path::new("reports"));
     }
 
     #[test]

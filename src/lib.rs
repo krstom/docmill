@@ -20,6 +20,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod conversion;
 pub mod engine;
 pub mod input;
 pub mod layout;

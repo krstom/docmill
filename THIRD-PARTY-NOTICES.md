@@ -22,6 +22,7 @@ install time, subject to that component's own license.
 | PP-OCRv5 mobile detection + recognition, and the PP-OCRv5/`en`/`ch` dictionaries | Apache-2.0 ([PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)) | official [PaddlePaddle](https://huggingface.co/PaddlePaddle) Hugging Face repos; converted locally to ONNX with [paddle2onnx](https://github.com/PaddlePaddle/Paddle2ONNX) (Apache-2.0) |
 | PP-OCRv3 English recognition ONNX export | Apache-2.0 | [RapidOCR](https://huggingface.co/SWHL/RapidOCR) Hugging Face repo |
 | PP-OCRv3 multilingual (`ch`) recognition | Apache-2.0 (PaddleOCR) | docling.rs models release |
+| PP-OCRv6 small page text detector | Apache-2.0 (PaddleOCR) | docling.rs models release; [RapidOCR mirror](https://www.modelscope.cn/models/RapidAI/RapidOCR) fallback |
 | Layout (RT-DETR "heron") and TableFormer ONNX exports | MIT ([docling / IBM](https://github.com/docling-project)) | docling.rs models release |
 
 ## Optional runtime services (not installed by this project)

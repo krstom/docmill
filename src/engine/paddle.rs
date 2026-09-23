@@ -10,12 +10,10 @@
 //!   {"rec_texts": ["…"]}}]}}`.
 //!
 //! The engine sends the PaddleHub shape first and retries once with the
-//! PaddleX shape on a 4xx (wrong-schema rejections come back as 400/422);
+//! PaddleX shape only on 400/422 (wrong-schema rejections);
 //! parsing is tolerant — known shapes first, then a recursive scan for
 //! `text`/`rec_texts` fields — so minor server-version drift degrades to
 //! "still extracts the text" rather than an error.
-
-use std::time::Duration;
 
 use super::{OcrEngine, OcrFailure, OcrText};
 use crate::layout::{self, Span};
@@ -23,32 +21,34 @@ use crate::layout::{self, Span};
 pub struct PaddleServer {
     endpoint: String,
     agent: ureq::Agent,
+    max_retries: u32,
+    paddlex: bool,
 }
 
 impl PaddleServer {
     pub fn new(endpoint: String, timeout_secs: u64) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_global(Some(Duration::from_secs(timeout_secs)))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        Self { endpoint, agent }
+        Self {
+            endpoint,
+            agent: super::remote::agent(timeout_secs),
+            max_retries: 3,
+            paddlex: false,
+        }
+    }
+
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     /// One POST; returns (status, body-text).
-    fn post(&self, payload: &str) -> Result<(u16, String), String> {
+    fn post(&self, payload: &str) -> Result<(u16, String), ureq::Error> {
         let mut resp = self
             .agent
             .post(&self.endpoint)
             .header("content-type", "application/json")
-            .send(payload.as_bytes())
-            .map_err(|e| format!("{}: {e}", self.endpoint))?;
+            .send(payload.as_bytes())?;
         let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("{}: read response: {e}", self.endpoint))?;
+        let text = resp.body_mut().read_to_string()?;
         Ok((status, text))
     }
 }
@@ -69,7 +69,10 @@ pub fn parse_paddle_response(body: &str) -> Result<OcrText, String> {
                 if text.is_empty() {
                     return None;
                 }
-                Some(with_bounds(text, poly_bounds(i["text_region"].as_array()?)?))
+                Some(with_bounds(
+                    text,
+                    poly_bounds(i["text_region"].as_array()?)?,
+                ))
             })
             .collect();
         return Ok(OcrText {
@@ -193,59 +196,87 @@ impl OcrEngine for PaddleServer {
     fn cache_salt(&self) -> String {
         // "grid|": the payload gained the layout rendering, so pre-grid cache
         // entries must miss rather than serve gridless.
-        format!("grid|{}", self.endpoint)
+        crate::cache::canonical_json(
+            serde_json::json!({"endpoint": self.endpoint, "parser": "paddle-grid-v2"}),
+        )
     }
 
     fn ocr(&mut self, bytes: &[u8], _mimetype: &str) -> Result<OcrText, OcrFailure> {
         let b64 = docling_core::base64::encode(bytes);
         let hub = serde_json::json!({ "images": [b64] }).to_string();
         let paddlex = serde_json::json!({ "file": b64, "fileType": 1 }).to_string();
-        let mut delay = Duration::from_secs(2);
-        let mut last_err = String::new();
-        for attempt in 0..4 {
-            if attempt > 0 {
-                std::thread::sleep(delay);
-                delay *= 2;
+        let mut use_paddlex = self.paddlex;
+        let result = super::remote::retry(&self.endpoint, self.max_retries, || {
+            if use_paddlex {
+                return self.post(&paddlex);
             }
-            match self.post(&hub) {
-                Ok((200, body)) => {
-                    return parse_paddle_response(&body).map_err(OcrFailure::Transient)
-                }
-                // Schema rejection → speak PaddleX once within this attempt.
-                Ok((s, _)) if (400..500).contains(&s) && s != 408 && s != 429 => {
-                    match self.post(&paddlex) {
-                        Ok((200, body)) => {
-                            return parse_paddle_response(&body).map_err(OcrFailure::Transient)
-                        }
-                        Ok((s2, body)) => {
-                            // Both shapes rejected: configuration problem.
-                            return Err(OcrFailure::Engine(format!(
-                                "{}: HTTP {s} (hub shape) / HTTP {s2} (paddlex shape): {}",
-                                self.endpoint,
-                                body.chars().take(200).collect::<String>()
-                            )));
-                        }
-                        Err(e) => last_err = e,
-                    }
-                }
-                Ok((s, body)) => {
-                    last_err = format!(
-                        "{}: HTTP {s} (attempt {}): {}",
-                        self.endpoint,
-                        attempt + 1,
-                        body.replace(['\n', '\r'], " ").chars().take(300).collect::<String>()
-                    );
-                }
-                Err(e) => last_err = format!("{e} (attempt {})", attempt + 1),
+            let response = self.post(&hub)?;
+            if matches!(response.0, 400 | 422) {
+                use_paddlex = true;
+                return self.post(&paddlex);
             }
-        }
-        Err(OcrFailure::Transient(format!("giving up after 4 attempts: {last_err}")))
+            Ok(response)
+        });
+        self.paddlex = use_paddlex;
+        parse_paddle_response(&result?).map_err(OcrFailure::Transient)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn http_schema_negotiation_is_limited_to_400_and_422_and_remembered() {
+        for status in [400, 422, 401, 403, 404, 413, 415] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/ocr", server.server_addr());
+            let negotiates = matches!(status, 400 | 422);
+            let handle = std::thread::spawn(move || {
+                let mut bodies = Vec::new();
+                while let Some(mut request) = server
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .unwrap()
+                {
+                    let mut body = String::new();
+                    request.as_reader().read_to_string(&mut body).unwrap();
+                    bodies.push(serde_json::from_str::<serde_json::Value>(&body).unwrap());
+                    let code = if bodies.len() == 1 { status } else { 200 };
+                    request
+                        .respond(
+                            tiny_http::Response::from_string(
+                                r#"{"results":[[{"text":"recognized"}]]}"#,
+                            )
+                            .with_status_code(code),
+                        )
+                        .unwrap();
+                }
+                bodies
+            });
+            let mut engine = PaddleServer::new(url, 2).max_retries(0);
+            if negotiates {
+                assert_eq!(
+                    engine.ocr(b"image", "image/png").unwrap().text,
+                    "recognized"
+                );
+                assert_eq!(engine.ocr(b"next", "image/png").unwrap().text, "recognized");
+            } else {
+                assert!(engine.ocr(b"image", "image/png").is_err());
+            }
+            let bodies = handle.join().unwrap();
+            assert_eq!(
+                bodies.len(),
+                if negotiates { 3 } else { 1 },
+                "HTTP {status}"
+            );
+            assert!(bodies[0].get("images").is_some());
+            for body in &bodies[1..] {
+                assert_eq!(body["fileType"], 1);
+                assert!(body.get("images").is_none());
+            }
+        }
+    }
 
     #[test]
     fn parses_paddlehub_shape() {
@@ -262,7 +293,10 @@ mod tests {
     fn parses_paddlehub_empty_result() {
         // A textless image: results[0] exists but is empty — valid empty text.
         let body = r#"{"results":[[]],"status":"000"}"#;
-        assert_eq!(parse_paddle_response(body).unwrap(), OcrText::plain(String::new()));
+        assert_eq!(
+            parse_paddle_response(body).unwrap(),
+            OcrText::plain(String::new())
+        );
     }
 
     #[test]

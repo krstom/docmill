@@ -1,8 +1,8 @@
 //! On-disk OCR result cache, keyed by content hash.
 //!
-//! Key = sha256 over (engine id, engine cache-salt, image bytes) — the salt
-//! folds in every parameter that changes an engine's output (model paths,
-//! endpoint, prompt), so switching models never serves stale text. Layout is
+//! Key = sha256 over (schema, version, engine id, cache-salt, image bytes).
+//! The salt includes MIME type and output-affecting parameters (model content,
+//! endpoint, effective request), so switching models never serves stale text. Layout is
 //! `<dir>/<hh>/<hash>.json` (two-hex-char shard dirs keep any one directory
 //! small); each entry is a tiny JSON object `{"text","engine","created"}`.
 //!
@@ -64,6 +64,7 @@ impl OcrCache {
     /// the fields from running into each other ("ab"+"c" vs "a"+"bc").
     pub fn key(engine_id: &str, salt: &str, image: &[u8]) -> String {
         let mut h = Sha256::new();
+        h.update(concat!("docmill-ocr-v2\0", env!("CARGO_PKG_VERSION"), "\0").as_bytes());
         h.update(engine_id.as_bytes());
         h.update([0u8]);
         h.update(salt.as_bytes());
@@ -108,7 +109,10 @@ impl OcrCache {
             return;
         };
         if let Err(e) = self.put_inner(&path, entry) {
-            eprintln!("docmill: cache write {}: {e} (continuing uncached)", path.display());
+            eprintln!(
+                "docmill: cache write {}: {e} (continuing uncached)",
+                path.display()
+            );
         }
     }
 
@@ -131,8 +135,7 @@ impl OcrCache {
         // A batch worker may populate the same cache entry concurrently with
         // another worker. Give every writer its own temporary file so one
         // rename cannot steal another writer's in-progress data.
-        static NEXT_TMP: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), serial));
         {
@@ -148,6 +151,44 @@ impl OcrCache {
         }
         result
     }
+}
+
+/// Deterministic object ordering, including nested extra request parameters.
+/// serde_json's preserve_order feature is enabled by upstream, so insertion
+/// order must be normalized explicitly before constructing cache identities.
+pub fn canonical_json(mut value: serde_json::Value) -> String {
+    fn sort(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for value in map.values_mut() {
+                    sort(value);
+                }
+                map.sort_keys();
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(sort),
+            _ => {}
+        }
+    }
+    sort(&mut value);
+    value.to_string()
+}
+
+/// Fingerprint file contents, even for same-size rewrites at the same path.
+/// Engines compute this once when resolving their model configuration.
+#[cfg(any(feature = "local-ocr", test))]
+pub(crate) fn file_digest(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Unix seconds now — the `created` stamp for fresh entries.
@@ -171,7 +212,10 @@ mod tests {
         assert_ne!(k, OcrCache::key("vlm", "en", b"imagebytes"));
         assert_ne!(k, OcrCache::key("ppocr", "ch", b"imagebytes"));
         assert_ne!(k, OcrCache::key("ppocr", "en", b"imagebyteS"));
-        assert_ne!(OcrCache::key("a", "bc", b"d"), OcrCache::key("ab", "c", b"d"));
+        assert_ne!(
+            OcrCache::key("a", "bc", b"d"),
+            OcrCache::key("ab", "c", b"d")
+        );
     }
 
     #[test]
@@ -270,5 +314,24 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temporary cache files: {leftovers:?}");
+    }
+    #[test]
+    fn identity_tracks_file_bytes_and_canonicalizes_nested_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("rec.onnx");
+        std::fs::write(&model, b"model A").unwrap();
+        let modified = std::fs::metadata(&model).unwrap().modified().unwrap();
+        let before = file_digest(&model).unwrap();
+        std::fs::write(&model, b"model B").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&model)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_ne!(before, file_digest(&model).unwrap());
+        let a = serde_json::from_str(r#"{"z":1,"extra":{"b":2,"a":1}}"#).unwrap();
+        let b = serde_json::from_str(r#"{"extra":{"a":1,"b":2},"z":1}"#).unwrap();
+        assert_eq!(canonical_json(a), canonical_json(b));
     }
 }

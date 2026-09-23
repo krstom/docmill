@@ -87,9 +87,9 @@ if [ "$DO_BUILD" = true ]; then
   if [ -n "$ORT_DIR" ]; then
     say "linking onnxruntime dynamically from $ORT_DIR (bundled into lib/)"
     env ORT_LIB_LOCATION="$ORT_DIR" ORT_PREFER_DYNAMIC_LINK=1 \
-        RUSTFLAGS="${RUSTFLAGS:-} $RPATH_FLAG" cargo build --release
+        RUSTFLAGS="${RUSTFLAGS:-} $RPATH_FLAG" cargo build --locked --release
   else
-    env RUSTFLAGS="${RUSTFLAGS:-} $RPATH_FLAG" cargo build --release
+    env RUSTFLAGS="${RUSTFLAGS:-} $RPATH_FLAG" cargo build --locked --release
   fi
 fi
 [ -x target/release/docmill ] || die "no release binary (run without --no-build)"

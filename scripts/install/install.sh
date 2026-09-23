@@ -34,6 +34,7 @@ set -euo pipefail
 PREFIX="${DOCMILL_PREFIX:-/usr/local/docmill}"
 BIN_DIR="${DOCMILL_BIN_DIR:-/usr/local/bin}"
 DOCLING_RS_REPO="https://github.com/docling-project/docling.rs"
+DOCLING_RS_REF="8f665b094c1ac2a5ff6d6d6f0a84e1939476c23b"
 
 say() { printf '\033[1m[docmill]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[docmill]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -74,8 +75,17 @@ DOCLING_RS="${DOCLING_RS_DIR:-$SRC_DIR/../docling.rs}"
 if [ ! -f "$DOCLING_RS/crates/docling/Cargo.toml" ]; then
   say "cloning docling.rs beside the checkout (path dependency)"
   command -v git >/dev/null 2>&1 || die "git is required to clone docling.rs"
-  git clone --depth 1 "$DOCLING_RS_REPO" "$DOCLING_RS"
+  git clone --depth 1 --branch v1.67.0 "$DOCLING_RS_REPO" "$DOCLING_RS"
 fi
+
+# Cargo's path dependency is fixed; fail before downloads if an override
+# points somewhere else. Never reset or modify an existing upstream checkout.
+[ -d "$SRC_DIR/../docling.rs" ] || die "place docling.rs at $SRC_DIR/../docling.rs (Cargo path dependency)"
+[ "$(cd "$DOCLING_RS" && pwd -P)" = "$(cd "$SRC_DIR/../docling.rs" && pwd -P)" ] \
+  || die "DOCLING_RS_DIR must resolve to the sibling ../docling.rs used by Cargo"
+command -v git >/dev/null 2>&1 || die "git is required to verify the upstream revision"
+[ "$(git -C "$DOCLING_RS" rev-parse HEAD)" = "$DOCLING_RS_REF" ] \
+  || die "docmill requires docling.rs v1.67.0 ($DOCLING_RS_REF). Prepare that revision in ../docling.rs; your checkout has been left untouched."
 
 # --- 2. Runtime models ---------------------------------------------------------
 say "fetching runtime models (idempotent)"
@@ -93,7 +103,7 @@ if [ -d vendor/onnxruntime/lib ] || [ -n "${ORT_LIB_LOCATION:-}" ]; then
 fi
 say "building the CLI (release)"
 # ${arr[@]+…} keeps the empty-array case safe under set -u on macOS's bash 3.2.
-env ${BUILD_ENV[@]+"${BUILD_ENV[@]}"} cargo build --release
+env ${BUILD_ENV[@]+"${BUILD_ENV[@]}"} cargo build --locked --release
 
 # --- 4. Install tree -------------------------------------------------------------
 say "installing to $PREFIX"

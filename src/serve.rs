@@ -2,11 +2,9 @@
 //!
 //! Deliberately minimal, in the spirit of the CLI: `tiny_http` (synchronous,
 //! like the converter — an async runtime would only add moving parts), one
-//! warm [`OcrRunner`] shared across requests (models load once, the disk
-//! cache dedupes repeats), and a conversion mutex so concurrent uploads
-//! queue instead of fighting over CPU. Intended to listen on localhost
-//! behind an nginx proxy — TLS, auth, and rate limiting are nginx's job
-//! (see the README's nginx snippet).
+//! warm OCR runner and PDF pipeline owned by one conversion worker. Four
+//! requests may wait in the queue, before their bodies are buffered. Health
+//! checks are handled independently. Bind behind nginx for TLS/auth.
 //!
 //! Routes:
 //! - `GET /`         a tiny HTML upload form for manual testing
@@ -21,9 +19,13 @@
 //!                   engine switching is deliberately not offered.
 
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, SyncSender};
+use std::time::Duration;
 
-use docling::{DocumentConverter, InputFormat, SourceDocument};
+use crate::conversion::{
+    normalize_ocr_lang, parse_ocr_mode, parse_ocr_scale, ConversionOptions, WarmPipeline,
+};
+use docling::{ImageMode, InputFormat, SourceDocument};
 use tiny_http::{Header, Method, Response, Server};
 
 use crate::config::ImgOcrConfig;
@@ -38,50 +40,101 @@ const MAX_BODY: usize = 200 * 1024 * 1024;
 pub struct ServeConfig {
     pub addr: String,
     pub cfg: ImgOcrConfig,
+    pub conversion: ConversionOptions,
 }
 
 pub fn serve(sc: ServeConfig) -> Result<(), String> {
-    let runner = if sc.cfg.mode == OutputMode::Placeholder {
-        None
-    } else {
-        Some(sc.cfg.build_runner()?)
-    };
     let server = Server::http(&sc.addr).map_err(|e| format!("bind {}: {e}", sc.addr))?;
     eprintln!(
         "docmill serve: listening on http://{} (mode {:?}, engines {:?})",
         sc.addr, sc.cfg.mode, sc.cfg.engines
     );
-    let state = Arc::new(State {
+    let state = State {
         cfg: sc.cfg,
-        runner: Mutex::new(runner),
-    });
-    // Thread-per-request: /health and the form stay responsive while a long
-    // conversion holds the runner lock.
-    for request in server.incoming_requests() {
-        let state = state.clone();
-        std::thread::spawn(move || handle(request, &state));
+        conversion: sc.conversion,
+    };
+    let mut worker = WorkerState::default();
+    if state.cfg.mode != OutputMode::Placeholder {
+        worker.runner = Some(
+            state
+                .cfg
+                .build_runner()?
+                .with_cooldown(Duration::from_secs(30)),
+        );
     }
+    let (tx, rx) = mpsc::sync_channel::<tiny_http::Request>(4);
+    let worker_thread = std::thread::spawn(move || {
+        for mut request in rx {
+            let query = request
+                .url()
+                .split_once('?')
+                .map(|(_, q)| q.to_string())
+                .unwrap_or_default();
+            let response = recover(&mut worker, |worker| {
+                convert(&mut request, &query, &state, worker)
+            });
+            let _ = request.respond(response);
+        }
+    });
+    for request in server.incoming_requests() {
+        dispatch(request, &tx);
+    }
+    drop(tx);
+    worker_thread
+        .join()
+        .map_err(|_| "conversion worker stopped unexpectedly".to_string())?;
     Ok(())
 }
 
 struct State {
     cfg: ImgOcrConfig,
-    runner: Mutex<Option<OcrRunner>>,
+    conversion: ConversionOptions,
 }
 
-fn handle(mut request: tiny_http::Request, state: &State) {
-    let url = request.url().to_string();
-    let (path, query) = match url.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (url, String::new()),
-    };
-    let response = match (request.method(), path.as_str()) {
+#[derive(Default)]
+struct WorkerState {
+    runner: Option<OcrRunner>,
+    pipeline: WarmPipeline,
+}
+
+fn recover(
+    worker: &mut WorkerState,
+    convert: impl FnOnce(&mut WorkerState) -> Result<Resp, (u16, String)>,
+) -> Resp {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| convert(worker))) {
+        Ok(Ok(response)) => response,
+        Ok(Err((status, message))) => text(status, &format!("error: {message}\n")),
+        Err(_) => {
+            *worker = WorkerState::default();
+            eprintln!("docmill serve: conversion panicked; discarded worker models");
+            text(500, "error: conversion failed unexpectedly; worker reset\n")
+        }
+    }
+}
+
+fn dispatch(request: tiny_http::Request, tx: &SyncSender<tiny_http::Request>) {
+    let path = request.url().split('?').next().unwrap_or_default();
+    let response = match (request.method(), path) {
         (Method::Get, "/") => html(FORM_HTML),
         (Method::Get, "/health") => text(200, "ok\n"),
-        (Method::Post, "/convert") => match convert(&mut request, &query, state) {
-            Ok(resp) => resp,
-            Err((status, msg)) => text(status, &format!("error: {msg}\n")),
-        },
+        (Method::Post, "/convert") => {
+            if request.body_length().is_some_and(|len| len > MAX_BODY) {
+                text(413, "error: body exceeds 200 MiB\n")
+            } else {
+                match tx.try_send(request) {
+                    Ok(()) => return,
+                    Err(error) => {
+                        let request = match error {
+                            mpsc::TrySendError::Full(request)
+                            | mpsc::TrySendError::Disconnected(request) => request,
+                        };
+                        let _ = request
+                            .respond(text(503, "error: conversion queue is full; retry later\n"));
+                        return;
+                    }
+                }
+            }
+        }
         _ => text(404, "not found (try GET /, GET /health, POST /convert)\n"),
     };
     let _ = request.respond(response);
@@ -113,6 +166,7 @@ fn convert(
     request: &mut tiny_http::Request,
     query: &str,
     state: &State,
+    worker: &mut WorkerState,
 ) -> Result<Resp, (u16, String)> {
     let mut opts = parse_query(query);
     let content_type = request
@@ -160,15 +214,21 @@ fn convert(
     if !matches!(to, "md" | "markdown" | "json") {
         return Err((400, format!("to={to:?} is not md|json")));
     }
-    let strict = matches!(opts.get("strict").map(String::as_str), Some("1" | "true"));
-    let force_full_page_ocr = matches!(
-        opts.get("force_full_page_ocr").map(String::as_str),
-        Some("1" | "true")
-    );
-    let no_text_panels = matches!(
-        opts.get("no_text_panels").map(String::as_str),
-        Some("1" | "true")
-    );
+    let conversion = request_conversion(&opts, &state.conversion).map_err(|e| (400, e))?;
+    let images = match opts
+        .get("images")
+        .map(String::as_str)
+        .unwrap_or("placeholder")
+    {
+        "placeholder" => ImageMode::Placeholder,
+        "embedded" => ImageMode::Embedded,
+        _ => {
+            return Err((
+                400,
+                "images must be placeholder|embedded; referenced artifacts are not served".into(),
+            ))
+        }
+    };
     let mode = match opts.get("mode").map(String::as_str) {
         None => state.cfg.mode,
         Some("fence") => OutputMode::Fence,
@@ -178,40 +238,37 @@ fn convert(
         Some("placeholder") => OutputMode::Placeholder,
         Some(other) => return Err((400, format!("mode={other:?} is unknown"))),
     };
-    let pages = match opts.get("pages") {
-        Some(p) => Some(docling::parse_page_range(p).map_err(|e| (400, format!("pages: {e}")))?),
-        None => None,
-    };
-
     let run_ocr = mode != OutputMode::Placeholder;
     let mut document = {
         let format = source.format;
         let source = SourceDocument::from_bytes(source.name, format, source.bytes);
         if run_ocr && state.cfg.remote_first() && format == InputFormat::Image {
-            one_picture_document(&filename, source.bytes, strict)
+            one_picture_document(&filename, source.bytes, conversion.strict)
         } else {
-            let mut converter = DocumentConverter::new()
-                .strict(strict)
-                .force_full_page_ocr(force_full_page_ocr)
-                .no_text_panels(no_text_panels);
-            if let Some((first, last)) = pages {
-                converter = converter.page_range(first, last);
-            }
-            converter
-                .convert(source)
-                .map(|r| r.document)
+            worker
+                .pipeline
+                .convert(source, &conversion)
                 .map_err(|e| (422, format!("convert {filename}: {e}")))?
         }
     };
 
+    conversion.finish_document(&mut document);
     if run_ocr {
-        let mut guard = state.runner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(runner) = guard.as_mut() {
+        if worker.runner.is_none() {
+            worker.runner = Some(
+                state
+                    .cfg
+                    .build_runner()
+                    .map_err(|e| (500, e))?
+                    .with_cooldown(Duration::from_secs(30)),
+            );
+        }
+        if let Some(runner) = worker.runner.as_mut() {
             let post = PostOptions {
                 mode,
                 min_pixels: state.cfg.min_pixels,
-                keep_picture: false,
-                ocr_hidden: false,
+                keep_picture: images != ImageMode::Placeholder,
+                target: postprocess::OutputTarget::from_format(&to),
             };
             let stats = postprocess::apply(&mut document, runner, &post);
             eprintln!("convert {filename}: {stats}");
@@ -227,10 +284,52 @@ fn convert(
     } else {
         with_type(
             200,
-            document.export_to_markdown().into_bytes(),
+            document
+                .export_to_markdown_with_images(images, "artifacts")
+                .0
+                .into_bytes(),
             "text/markdown; charset=utf-8",
         )
     })
+}
+
+fn request_conversion(
+    opts: &std::collections::HashMap<String, String>,
+    defaults: &ConversionOptions,
+) -> Result<ConversionOptions, String> {
+    let mut conversion = defaults.clone();
+    let flag = |name: &str, default: bool| match opts.get(name).map(String::as_str) {
+        None => Ok(default),
+        Some("1" | "true") => Ok(true),
+        Some("0" | "false") => Ok(false),
+        Some(_) => Err(format!("{name} must be 0|1|false|true")),
+    };
+    conversion.strict = flag("strict", conversion.strict)?;
+    conversion.no_ocr = flag("no_ocr", conversion.no_ocr)?;
+    conversion.no_table_former = flag("no_table_former", conversion.no_table_former)?;
+    conversion.skip_ocr = flag("skip_ocr", conversion.skip_ocr)?;
+    conversion.force_full_page_ocr = flag("force_full_page_ocr", conversion.force_full_page_ocr)?;
+    conversion.no_text_panels = flag("no_text_panels", conversion.no_text_panels)?;
+    conversion.heading_hierarchy = flag("heading_hierarchy", conversion.heading_hierarchy)?;
+    if let Some(pages) = opts.get("pages") {
+        conversion.pages = Some(docling::parse_page_range(pages).map_err(|e| e.to_string())?);
+    }
+    if let Some(lang) = opts.get("ocr_lang") {
+        conversion.ocr_lang = Some(normalize_ocr_lang(lang)?);
+    }
+    if let Some(mode) = opts.get("ocr_mode") {
+        conversion.ocr_mode = Some(parse_ocr_mode(mode)?);
+    }
+    if let Some(scale) = opts.get("ocr_scale") {
+        conversion.ocr_scale = Some(parse_ocr_scale(scale)?);
+    }
+    if let Some(encoding) = opts.get("encoding") {
+        conversion.encoding = Some(encoding.clone());
+    }
+    if let Some(placeholder) = opts.get("page_break_placeholder") {
+        conversion.page_break_placeholder = Some(placeholder.clone());
+    }
+    Ok(conversion)
 }
 
 fn input_error_status(error: &InputError) -> u16 {
@@ -429,5 +528,119 @@ mod tests {
             Some("----abc123".to_string())
         );
         assert_eq!(multipart_boundary("application/json"), None);
+    }
+    #[test]
+    fn per_request_options_reset_to_startup_defaults() {
+        let defaults = ConversionOptions::default();
+        let custom = request_conversion(&parse_query("skip_ocr=1&ocr_mode=full_page&ocr_scale=3&heading_hierarchy=1&ocr_lang=zh-Hant&pages=2-3&encoding=windows-1251&page_break_placeholder=PAGE"), &defaults).unwrap();
+        assert!(custom.skip_ocr && custom.heading_hierarchy);
+        assert_eq!(custom.ocr_lang.as_deref(), Some("ch"));
+        assert_eq!(custom.pages, Some((2, 3)));
+        let reset = request_conversion(&parse_query(""), &defaults).unwrap();
+        assert!(!reset.skip_ocr && !reset.heading_hierarchy);
+        assert_eq!(reset.ocr_scale, None);
+        assert_eq!(reset.pages, None);
+        assert_eq!(reset.encoding, None);
+        assert_eq!(reset.page_break_placeholder, None);
+        assert!(request_conversion(&parse_query("skip_ocr=maybe"), &defaults).is_err());
+        assert!(request_conversion(&parse_query("ocr_scale=NaN"), &defaults).is_err());
+    }
+
+    #[test]
+    fn a_panicking_conversion_resets_worker_and_returns_500() {
+        let (engine, _) = crate::engine::tests::MockEngine::new("mock", vec![]);
+        let mut worker = WorkerState {
+            runner: Some(OcrRunner::new(
+                vec![Box::new(engine)],
+                crate::cache::OcrCache::disabled(),
+            )),
+            ..Default::default()
+        };
+        let response = recover(&mut worker, |_| panic!("simulated backend panic"));
+        assert_eq!(response.status_code().0, 500);
+        assert!(worker.runner.is_none());
+        assert_eq!(
+            recover(&mut worker, |_| Ok(text(200, "recovered")))
+                .status_code()
+                .0,
+            200
+        );
+    }
+
+    #[test]
+    fn queue_is_bounded_and_health_does_not_wait_for_conversion() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let (tx, rx) = mpsc::sync_channel(4);
+        let submit = |path: &str, method: &str| {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(client, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let request = server
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            dispatch(request, &tx);
+            client
+        };
+        let queued: Vec<_> = (0..4)
+            .map(|_| submit("/convert?filename=test.md", "POST"))
+            .collect();
+        let mut rejected = submit("/convert?filename=test.md", "POST");
+        let mut response = String::new();
+        rejected.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        let mut health = submit("/health", "GET");
+        response.clear();
+        health.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        for request in rx.try_iter() {
+            request.respond(text(200, "done")).unwrap();
+        }
+        drop(queued);
+    }
+
+    #[test]
+    fn raw_upload_uses_encoding_and_rejects_referenced_images() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        let state = State {
+            cfg: ImgOcrConfig::resolve(crate::config::CliOverrides {
+                engine: Some("local".into()),
+                mode: Some("placeholder".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            conversion: ConversionOptions::default(),
+        };
+        let server = Server::http("127.0.0.1:0").unwrap();
+        for (query, expected) in [
+            ("filename=test.txt&encoding=windows-1251", 200),
+            ("filename=test.txt&images=referenced", 400),
+        ] {
+            let mut client = TcpStream::connect(server.server_addr().to_ip().unwrap()).unwrap();
+            write!(client, "POST /convert?{query} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\nConnection: close\r\n\r\n").unwrap();
+            client
+                .write_all(&[0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2])
+                .unwrap();
+            let mut request = server
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            let response = recover(&mut WorkerState::default(), |worker| {
+                convert(&mut request, query, &state, worker)
+            });
+            assert_eq!(response.status_code().0, expected);
+            request.respond(response).unwrap();
+            let mut body = String::new();
+            client.read_to_string(&mut body).unwrap();
+            if expected == 200 {
+                assert!(body.contains("Привет"), "{body}");
+            }
+        }
     }
 }

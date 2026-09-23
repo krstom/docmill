@@ -93,6 +93,19 @@ fetch_optional() { # <url> <dest> — ignore a missing/failed asset
   fi
 }
 
+fetch_mirrored() { # <dest> <mirror> <fallback>
+  if [ "$FORCE" = false ] && [ -s "$1" ]; then return 0; fi
+  # shellcheck disable=SC2086
+  if curl -fsSL $CURL_TIMEOUTS -o "$1.download" "$2" 2>/dev/null \
+      || curl -fsSL $CURL_TIMEOUTS -o "$1.download" "$3"; then
+    mv "$1.download" "$1"
+    echo "  > $1"
+  else
+    rm -f "$1.download"
+    return 1
+  fi
+}
+
 # --- PDF pipeline assets (docling.rs models release) -------------------------
 # pdfium is the one platform-specific binary: Linux uses the docling.rs
 # release's libpdfium.so; macOS fetches the official pdfium-binaries build
@@ -123,10 +136,14 @@ if [ "$WITH_PDF" = true ]; then
   echo "fetching PDF pipeline assets from $BASE_URL"
   mkdir -p .pdfium/lib
   fetch_pdfium
+  fetch_mirrored .models/ocr_det.onnx "$BASE_URL/ocr_det.onnx" \
+    "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx" \
+    || echo "warning: page detector unavailable; using region-scoped page OCR" >&2
   fetch "$BASE_URL/layout_heron.onnx" .models/layout_heron.onnx
   fetch_optional "$BASE_URL/layout_heron_int8.onnx" .models/layout_heron_int8.onnx
   if [ "$WITH_TABLEFORMER" = true ]; then
     mkdir -p .models/tableformer
+    fetch_optional "$BASE_URL/encoder_fp16.onnx" .models/tableformer/encoder_fp16.onnx
     fetch "$BASE_URL/encoder.onnx" .models/tableformer/encoder.onnx
     fetch_optional "$BASE_URL/encoder.onnx.data" .models/tableformer/encoder.onnx.data
     fetch "$BASE_URL/decoder.onnx" .models/tableformer/decoder.onnx
@@ -142,8 +159,10 @@ fi
 echo "fetching PP-OCRv3 recognition pairs"
 fetch "$BASE_URL/ocr_rec.onnx" .models/ocr_rec.onnx
 fetch "$BASE_URL/ppocr_keys_v1.txt" .models/ppocr_keys_v1.txt
-fetch "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx" .models/ocr_rec_en.onnx
-fetch "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt" .models/en_dict.txt
+fetch_mirrored .models/ocr_rec_en.onnx "$BASE_URL/ocr_rec_en.onnx" \
+  "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv3/en_PP-OCRv3_rec_infer.onnx"
+fetch_mirrored .models/en_dict.txt "$BASE_URL/en_dict.txt" \
+  "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/en_dict.txt"
 
 # --- PP-OCRv5 det+rec (the local picture-OCR engine's preferred models) ------
 # No public host serves these as ONNX, so we fetch the official PaddlePaddle

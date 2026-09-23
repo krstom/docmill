@@ -70,8 +70,15 @@ Text after the picture.
 Chains compose: `--img-ocr-engine local,vlm` tries the local model first and
 falls back to the endpoint per image. A broken engine (missing model, bad
 endpoint) warns once and is skipped; a downed server is dropped after 3
-consecutive failures. A picture no engine could read keeps its placeholder —
+consecutive transient failures in CLI runs. The service waits 30 seconds
+before trying it again. A picture no engine could read keeps its placeholder —
 OCR problems never fail the conversion.
+
+Remote calls retry transport errors and HTTP 408/429/5xx up to three times
+with 2/4/8-second backoff. A local request timeout immediately falls through
+to the next engine. `--img-ocr-max-retries 0` disables retries. Paddle's
+alternate request schema is attempted only after HTTP 400 or 422, never
+after an authentication or missing-endpoint response.
 
 ## Output modes (`--img-ocr-mode`)
 
@@ -91,18 +98,32 @@ OCR text is appended after it. A picture whose OCR comes back empty (a logo,
 a decorative border) is dropped from the output entirely — no placeholder —
 unless the image itself renders (`--images embedded|referenced`) or every
 engine *failed* (then the placeholder stays, since text may exist). Captions
-are preserved. Pictures in layers
-Markdown/JSON omit (DOCX headers/footers, DocLang-only content) are OCR'd only
-for `--to dclx`, so no engine calls are wasted on header logos.
+and caption links are preserved. OCR follows the selected exporter:
+Markdown and chunks omit hidden content; DocLang includes furniture and
+rich table cells. JSON processes the authoritative item tree when present
+(including its content layers and rich cells), preserving hierarchy,
+comments and provenance. Flat-node JSON follows upstream's layer rules.
+Only the representation selected for export is transformed.
 
 ## Cache
 
 Results land in `~/.cache/docmill` (override:
 `--img-ocr-cache-dir` / `DOCMILL_CACHE_DIR`; disable:
-`--no-img-ocr-cache`), keyed by sha256 over engine + parameters + image bytes —
-identical images are OCR'd once across all runs and documents, and changing
-the model/endpoint/prompt invalidates naturally. Empty results are cached too
-(negative caching). A run reports what happened:
+`--no-img-ocr-cache`), keyed by SHA-256 over the cache schema, docmill version,
+engine, output-affecting settings, MIME type and image bytes. Local model,
+dictionary and `.onnx.data` contents participate in the identity, so replacing
+a model at the same path invalidates its results. VLM identity uses the
+effective request body, including `DOCMILL_EXTRA_BODY`, with canonical JSON
+key ordering. Credentials, timeouts, retries and presentation modes do not
+affect identity. This release intentionally misses older cache entries;
+existing files can remain on disk.
+
+Local fingerprints are computed at the first picture lookup and reused by
+that OCR runner. Restart the service after replacing model files.
+
+Each engine gets a cache lookup followed by a live attempt, in configured
+order. A cached fallback therefore cannot mask a recovered preferred engine.
+Empty results are cached too. A run reports what happened:
 
 ```
 docmill: 7 picture(s), 5 ocr'd (3 cached), 1 skipped (small), 0 skipped (structured table), 1 empty, 0 failed
@@ -126,10 +147,12 @@ Every `--img-ocr-*` flag falls back to a `DOCMILL_*` env var
 | `--img-ocr-cache-dir DIR` | `DOCMILL_CACHE_DIR` | `~/.cache/docmill` |
 | `--no-img-ocr-cache` | — | cache on |
 | `--img-ocr-timeout SECS` | `DOCMILL_TIMEOUT` | `120` |
+| `--img-ocr-max-retries N` | `DOCMILL_MAX_RETRIES` | `3` (retries after the initial attempt) |
 | `--img-ocr-models-dir DIR` | `DOCMILL_MODELS_DIR` | `./.models` |
 
-`DOCMILL_EXTRA_BODY` merges a JSON object into every vlm request
-(server-specific knobs the OpenAI shape doesn't cover). The local engine also
+`DOCMILL_EXTRA_BODY` is validated once at startup and merges a JSON object
+into every VLM request (server-specific knobs the OpenAI shape doesn't cover).
+The local engine also
 honors explicit model paths: `DOCMILL_DET_ONNX` +
 `DOCMILL_REC_ONNX` + `DOCMILL_DICT` (all three → a v5
 det+rec set), or docling.rs's `DOCLING_OCR_REC_ONNX` / `DOCLING_OCR_DICT`
@@ -143,8 +166,21 @@ path): `--to md|json|dclx|chunks`, `-o/--output`, `--input GLOB|DIR`, `--jobs N`
 `--no-table-former`, `--no-ocr`, `--force-full-page-ocr` (OCR every PDF page
 even when it has a text layer), `--no-text-panels` (keep every detected
 picture as a picture instead of demoting text panels to paragraphs),
-`--ocr-lang en|ch` (the PDF pipeline's own page OCR — independent of picture
-OCR), `--asr-model`, `--asr-lang CODE|auto`, `--video-frames`, and `--enrich-*`.
+`--ocr-lang TAG` (English/Chinese page OCR, including aliases such as `en-US`,
+`iso:eng` and `zh-Hant` — independent of picture OCR), `--asr-model`,
+`--asr-lang CODE|auto`, `--video-frames`, and `--enrich-*`.
+
+New page conversion controls apply consistently to single files, batches and
+HTTP requests:
+
+| CLI flag | Purpose |
+|---|---|
+| `--skip-ocr` | Skip page text recognition while retaining layout, tables and picture crops. Picture OCR still runs. |
+| `--ocr-mode MODE` | `default`, `full_page`, `layout_regions`, or `pdf_aware_layout_regions` |
+| `--ocr-scale N` | Finite, positive OCR pixels per PDF point |
+| `--heading-hierarchy` | Infer PDF heading levels |
+| `--encoding NAME` | Decode text inputs with an explicit encoding, e.g. `windows-1251` |
+| `--page-break-placeholder TEXT` | Insert text between Markdown pages |
 
 Batch mode recursively converts a directory or the files matched by a quoted
 glob, keeps their relative directory structure under `--output DIR`, and uses
@@ -155,10 +191,12 @@ the remaining files continue, and the command exits non-zero if any failed.
 For a positional single input, `-o/--output` retains its existing meaning of
 an exact output filename.
 
-Tracking docling.rs: this release targets **v1.4.2**. It inherits upstream's
-RTF and XLSB backends, TSV/GIF/MPEG aliases, Visio and SVG, Apple iWork,
-StarOffice/OpenOffice formats, dBase/DIF/SYLK, scanned-page orientation fixes,
-and the intervening PDF fidelity and performance improvements.
+Tracking docling.rs: this release targets **v1.67.0**, commit
+`8f665b094c1ac2a5ff6d6d6f0a84e1939476c23b`. Cargo versions, CI and the
+installer are pinned together. It adopts upstream's item-tree JSON fidelity,
+page OCR controls and model asset updates, plus remote retry behavior from
+docling-mcp. See [upgrade validation](docs/UPGRADE_1_67.md) for coverage,
+measurements and limits.
 
 ## Format specifics
 
@@ -207,7 +245,9 @@ $ docmill your.docx > out.md
 Options via env vars: `DOCMILL_PREFIX` (default
 `/usr/local/docmill`), `DOCMILL_BIN_DIR` (default
 `/usr/local/bin`), `DOCMILL_SUDO=0`, `DOCLING_RS_DIR` (the docling.rs
-checkout; cloned beside this one when missing).
+checkout; cloned beside this one when missing). The installer verifies the
+pinned commit before downloading assets; it leaves mismatched existing
+checkouts untouched. `DOCLING_RS_DIR` must resolve to Cargo's sibling path.
 
 Runtime models alone (into the current directory, idempotent):
 
@@ -216,11 +256,16 @@ $ scripts/install/download_dependencies.sh          # everything
 $ scripts/install/download_dependencies.sh --no-pdf # picture-OCR models only
 ```
 
-Flags: `--force` re-fetch, `--no-pdf` (skip pdfium/layout/TableFormer),
+Flags: `--force` re-fetch, `--no-pdf` (skip pdfium/layout/page detector/TableFormer),
 `--no-tableformer`, `--no-v5` (skip the PP-OCRv5 conversion, which needs
 python3 + pip for a one-time paddle2onnx run), `--ort` (vendor the ONNX
 Runtime shared build for old-glibc hosts — see below; install.sh then links
 it dynamically with an rpath into the prefix automatically).
+
+The PDF assets now include an optional PP-OCRv6 page detector
+(`.models/ocr_det.onnx`) and TableFormer FP16 encoder. The page detector and
+English recognizer/dictionary use the upstream release mirror with source
+fallbacks. Local picture OCR continues to prefer the PP-OCRv5 det+rec pair.
 
 docling.rs v1 resolves runtime assets from `.models/` only. The download,
 install, and package scripts automatically rename a legacy `models/` directory
@@ -230,8 +275,8 @@ when `.models/` is absent. If both exist, they preserve both, warn, and use
 ## Web service (`docmill serve`)
 
 A small local HTTP conversion service — synchronous like the converter
-itself (tiny_http, no async runtime), with one warm OCR engine chain shared
-across requests and the same disk cache:
+itself (tiny_http, no async runtime), with one conversion worker owning a
+warm OCR engine chain and PDF/image pipeline, plus the same disk cache:
 
 ```console
 $ docmill serve --addr 127.0.0.1:8877 [--img-ocr-* flags]
@@ -240,13 +285,26 @@ $ docmill serve --addr 127.0.0.1:8877 [--img-ocr-* flags]
 - `POST /convert` — the file as `multipart/form-data` (field `file`, e.g.
   `curl -F file=@doc.docx`) or as the raw body with `?filename=doc.docx`.
   Optional query/form fields: `to=md|json`, `mode=fence|markers|text|quote|placeholder`,
-  `pages=A-B`, `strict=1`. Returns Markdown (`text/markdown`) or docling JSON.
+  `images=placeholder|embedded`, `pages=A-B`, `strict=1`, `no_ocr=1`,
+  `skip_ocr=1`, `no_table_former=1`, `force_full_page_ocr=1`, `no_text_panels=1`,
+  `ocr_lang=TAG`, `ocr_mode=MODE`, `ocr_scale=N`, `heading_hierarchy=1`,
+  `encoding=NAME`, `page_break_placeholder=TEXT`.
+  Returns Markdown (`text/markdown`) or docling JSON. `images=referenced`
+  returns HTTP 400 because the service does not serve artifact files.
 - `GET /health` — liveness (never blocks behind a running conversion).
 - `GET /` — a minimal HTML upload form for manual testing.
 
-The engine chain and models are fixed at server start so sessions stay warm;
-mode/format are per-request. Uploads are capped at 200 MiB. Bind to
-localhost and put nginx in front for TLS/auth/limits:
+Four conversions can wait while one runs; further requests receive HTTP 503
+before docmill buffers their bodies. `/health` bypasses conversion work.
+The engine chain is fixed at startup. Request settings start from the startup
+defaults each time; mutable pipeline options reset and construction options
+rebuild the pipeline when changed. A conversion panic returns HTTP 500 and
+discards worker state so the next request can recreate it.
+
+Uploads are capped at 200 MiB. Keep nginx request buffering and body limits
+enabled: tiny_http may drain unread request bodies when replying, so the
+application queue alone does not isolate slow or oversized direct uploads.
+Bind to localhost and put nginx in front for TLS/auth/limits:
 
 ```nginx
 location /docmill/ {
@@ -297,8 +355,9 @@ its `.models\` directory.
 ## Building manually
 
 ```console
-$ git clone <docling.rs> ../docling.rs   # sibling checkout
-$ cargo build --release                  # downloads all other deps from crates.io
+$ git clone --branch v1.67.0 https://github.com/docling-project/docling.rs ../docling.rs
+$ git -C ../docling.rs rev-parse HEAD # must be 8f665b094c1ac2a5ff6d6d6f0a84e1939476c23b
+$ cargo build --locked --release
 ```
 
 Features: `default = ["pdf", "asr", "fetch-images", "vlm", "local-ocr", "serve"]`.
@@ -326,11 +385,15 @@ $ LD_LIBRARY_PATH=$ORT_LIB_LOCATION target/release/docmill …
 
 ## Tests
 
-`cargo test` — the unit suite (content-first format detection, cache,
-post-processor with a mock engine, remote-response parsers, config resolution)
-needs no models and no network.
-On old-glibc hosts run it as `cargo test --no-default-features` or with the
-`ORT_LIB_LOCATION` setup above.
+Run `cargo test --locked`, `cargo test --locked --no-default-features`, and
+`cargo test --locked --no-default-features --features serve`. Tests cover
+format detection, item-tree/node OCR, cache identity, mock HTTP retry/schema
+behavior, service admission/recovery and CLI parity with the pinned upstream
+converter. They use committed upstream fixtures and local loopback HTTP;
+no model downloads or remote OCR services are needed at test runtime.
+On old-glibc hosts use the no-default-feature commands or the
+`ORT_LIB_LOCATION` setup above. CI runs the portable and service suites on
+Linux, macOS and Windows and checks default-feature compilation.
 
 ## License
 

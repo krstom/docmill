@@ -9,18 +9,36 @@
 //! (docling-core's `strict_text` does no HTML escaping), so `<!-- ocr:… -->`
 //! markers and `> ` quote prefixes survive as written.
 //!
-//! Pictures can arrive wrapped: `Located` (PDF/PPTX provenance), `Furniture`
-//! (DOCX headers/footers), `DoclangOnly` (ODF presentations) — the walker
-//! peels those and re-wraps its insertions in the same chain, so a furniture
-//! picture's OCR text stays furniture. Markdown and JSON omit the
-//! furniture/doclang-only layers entirely, so engines are only invoked for
-//! them when the output target is DocLang (`ocr_hidden`) — no remote calls
-//! wasted on header logos that can't appear in the output.
+//! Output-aware traversal preserves wrappers, content layers, captions and
+//! provenance. JSON uses the backend's item tree when present; other outputs
+//! use nodes, including rich table cells for DocLang.
 
 use docling_core::{ContentLayer, DoclingDocument, Node};
 use std::collections::HashMap;
 
 use crate::engine::OcrRunner;
+
+mod tree;
+
+/// The representation and content layers the requested exporter consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputTarget {
+    Markdown,
+    Json,
+    Doclang,
+    Chunks,
+}
+
+impl OutputTarget {
+    pub fn from_format(format: &str) -> Self {
+        match format {
+            "json" => Self::Json,
+            "dclx" => Self::Doclang,
+            "chunks" => Self::Chunks,
+            _ => Self::Markdown,
+        }
+    }
+}
 
 /// How OCR text lands in the document, per picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,9 +68,8 @@ pub struct PostOptions {
     /// Keep the Picture node and append the text after it (used with
     /// `--images embedded|referenced`, where the image itself still renders).
     pub keep_picture: bool,
-    /// Also OCR pictures in layers Markdown/JSON omit (furniture,
-    /// doclang-only) — enabled when the output target is DocLang.
-    pub ocr_hidden: bool,
+    /// Export target; determines the authoritative tree and visible layers.
+    pub target: OutputTarget,
 }
 
 /// Counters for the end-of-run summary line.
@@ -143,19 +160,31 @@ pub fn one_picture_document(name: &str, bytes: Vec<u8>, strict: bool) -> Docling
                 data: bytes,
             }),
             classification: None,
+            caption_href: None,
+            caption_parent: Default::default(),
         }],
         strict_markdown: strict,
         compact_tables: false,
         links: Vec::new(),
         confidence: None,
+        page_break_placeholder: None,
+        tree: None,
     }
 }
 
-/// Run the transform over the whole document. Returns the counters; the
-/// document is modified in place.
+/// Transform the representation consumed by `opts.target` in place. Other
+/// representations are left intact: export using this target after calling.
 pub fn apply(doc: &mut DoclingDocument, runner: &mut OcrRunner, opts: &PostOptions) -> OcrStats {
+    if opts.mode == OutputMode::Placeholder {
+        return OcrStats::default();
+    }
+    if opts.target == OutputTarget::Json {
+        if let Some(tree) = &mut doc.tree {
+            return tree::apply(tree, runner, opts);
+        }
+    }
     let mut stats = OcrStats::default();
-    let table_locations = table_locations(&doc.nodes);
+    let table_locations = table_locations(&doc.nodes, opts.target);
     let mut page = 0usize;
     walk(
         &mut doc.nodes,
@@ -169,59 +198,106 @@ pub fn apply(doc: &mut DoclingDocument, runner: &mut OcrRunner, opts: &PostOptio
     stats
 }
 
-type TableLocations = HashMap<usize, Vec<[u16; 4]>>;
+type TableLocations = HashMap<(usize, bool), Vec<[f64; 4]>>;
 
-fn table_locations(nodes: &[Node]) -> TableLocations {
-    fn collect(nodes: &[Node], page: &mut usize, out: &mut TableLocations) {
+fn location(wraps: &[Wrap]) -> Option<(bool, [f64; 4])> {
+    wraps
+        .iter()
+        .find_map(|w| match w {
+            Wrap::Prov { bbox, .. } => Some((true, bbox.map(f64::from))),
+            _ => None,
+        })
+        .or_else(|| {
+            wraps.iter().find_map(|w| match w {
+                Wrap::Located(bbox) => Some((false, bbox.map(f64::from))),
+                _ => None,
+            })
+        })
+}
+
+fn table_locations(nodes: &[Node], target: OutputTarget) -> TableLocations {
+    fn collect(nodes: &[Node], target: OutputTarget, page: &mut usize, out: &mut TableLocations) {
         for node in nodes {
-            if let Node::PageInfo { page_no, .. } = node {
+            let (wraps, inner) = peel(node);
+            if node_hidden(&wraps, inner, target) {
+                continue;
+            }
+            if let Node::PageInfo { page_no, .. } = inner {
                 *page = *page_no;
                 continue;
             }
-            let (wraps, inner) = peel(node);
             if let Node::Group { children, .. } = inner {
-                collect(children, page, out);
+                let mut child_page = wrapped_page(&wraps, *page);
+                collect(children, target, &mut child_page, out);
                 continue;
             }
             let Node::Table(table) = inner else { continue };
-            if !table
+            if table
                 .rows
                 .iter()
                 .flatten()
                 .any(|cell| !cell.trim().is_empty())
             {
-                continue;
+                if let Some((exact, bbox)) =
+                    location(&wraps).or_else(|| table.location.map(|b| (false, b.map(f64::from))))
+                {
+                    out.entry((wrapped_page(&wraps, *page), exact))
+                        .or_default()
+                        .push(bbox);
+                }
             }
-            let wrapper_location = wraps.iter().find_map(|wrap| match wrap {
-                Wrap::Located(location) => Some(*location),
-                _ => None,
-            });
-            if let Some(location) = wrapper_location.or(table.location) {
-                out.entry(*page).or_default().push(location);
+            if let Some(rows) = table
+                .cell_blocks
+                .as_ref()
+                .filter(|_| target == OutputTarget::Doclang)
+            {
+                for cell in rows.iter().flatten() {
+                    let mut child_page = wrapped_page(&wraps, *page);
+                    collect(cell, target, &mut child_page, out);
+                }
             }
         }
     }
 
     let mut out = HashMap::new();
     let mut page = 0usize;
-    collect(nodes, &mut page, &mut out);
+    collect(nodes, target, &mut page, &mut out);
     out
 }
 
 /// A wrapper layer peeled off on the way down to a Picture, reapplied to
 /// every node spliced in — insertions inherit the picture's layer/provenance.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Wrap {
     Furniture(ContentLayer),
     Located([u16; 4]),
     Doclang,
+    Commented(Vec<usize>),
+    Prov {
+        page_no: usize,
+        bbox: [f32; 4],
+        charspan: [usize; 2],
+        seq: Option<usize>,
+    },
 }
 
 impl Wrap {
-    fn hidden(self) -> bool {
-        // Markdown/JSON omit furniture and doclang-only content.
-        !matches!(self, Wrap::Located(_))
+    fn hidden(&self, target: OutputTarget) -> bool {
+        match self {
+            Self::Furniture(layer) => {
+                target != OutputTarget::Doclang
+                    && !(target == OutputTarget::Json && *layer == ContentLayer::Notes)
+            }
+            Self::Doclang => target != OutputTarget::Doclang,
+            _ => false,
+        }
     }
+}
+
+fn node_hidden(wraps: &[Wrap], node: &Node, target: OutputTarget) -> bool {
+    wraps.iter().any(|w| w.hidden(target))
+        || matches!(node, Node::Group { layer: Some(_), .. }
+            if !matches!(target, OutputTarget::Json | OutputTarget::Doclang))
 }
 
 /// Peel wrapper nodes down to the innermost node, recording the chain.
@@ -240,6 +316,30 @@ fn peel(node: &Node) -> (Vec<Wrap>, &Node) {
         Node::DoclangOnly(inner) => {
             let (mut wraps, n) = peel(inner);
             wraps.insert(0, Wrap::Doclang);
+            (wraps, n)
+        }
+        Node::Commented { comments, inner } => {
+            let (mut wraps, n) = peel(inner);
+            wraps.insert(0, Wrap::Commented(comments.clone()));
+            (wraps, n)
+        }
+        Node::Prov {
+            page_no,
+            bbox,
+            charspan,
+            seq,
+            inner,
+        } => {
+            let (mut wraps, n) = peel(inner);
+            wraps.insert(
+                0,
+                Wrap::Prov {
+                    page_no: *page_no,
+                    bbox: *bbox,
+                    charspan: *charspan,
+                    seq: *seq,
+                },
+            );
             (wraps, n)
         }
         other => (Vec::new(), other),
@@ -277,18 +377,49 @@ fn rewrap(wraps: &[Wrap], node: Node) -> Node {
             inner: Box::new(inner),
         },
         Wrap::Doclang => Node::DoclangOnly(Box::new(inner)),
+        Wrap::Commented(comments) => Node::Commented {
+            comments: comments.clone(),
+            inner: Box::new(inner),
+        },
+        Wrap::Prov {
+            page_no,
+            bbox,
+            charspan,
+            seq,
+        } => Node::Prov {
+            page_no: *page_no,
+            bbox: *bbox,
+            charspan: match peel(&inner).1 {
+                Node::Paragraph { text } | Node::Code { text, .. } | Node::Caption { text, .. } => {
+                    [0, text.chars().count()]
+                }
+                _ => *charspan,
+            },
+            seq: *seq,
+            inner: Box::new(inner),
+        },
     })
 }
 
-/// Locate the `Group` (if any) at the end of a wrapper chain, mutably.
-fn group_children(node: &mut Node) -> Option<&mut Vec<Node>> {
+fn unwrapped_mut(node: &mut Node) -> &mut Node {
     match node {
-        Node::Group { children, .. } => Some(children),
-        Node::Furniture { inner, .. } | Node::Located { inner, .. } | Node::DoclangOnly(inner) => {
-            group_children(inner)
-        }
-        _ => None,
+        Node::Furniture { inner, .. }
+        | Node::Located { inner, .. }
+        | Node::Prov { inner, .. }
+        | Node::Commented { inner, .. }
+        | Node::DoclangOnly(inner) => unwrapped_mut(inner),
+        _ => node,
     }
+}
+
+fn wrapped_page(wraps: &[Wrap], page: usize) -> usize {
+    wraps
+        .iter()
+        .find_map(|w| match w {
+            Wrap::Prov { page_no, .. } => Some(*page_no),
+            _ => None,
+        })
+        .unwrap_or(page)
 }
 
 fn walk(
@@ -307,16 +438,16 @@ fn walk(
             i += 1;
             continue;
         }
-        // Wrapped groups first (e.g. a Located slide group): recurse, marking
-        // the subtree hidden when any wrapper on the way is a hidden layer.
-        {
-            let (wraps, _) = peel(&nodes[i]);
-            let sub_hidden = hidden || wraps.iter().any(|w| w.hidden());
-            if let Some(children) = group_children(&mut nodes[i]) {
+        let (wraps, inner) = peel(&nodes[i]);
+        let effective_page = wrapped_page(&wraps, *page);
+        let sub_hidden = hidden || node_hidden(&wraps, inner, opts.target);
+        match unwrapped_mut(&mut nodes[i]) {
+            Node::Group { children, .. } => {
+                let mut child_page = effective_page;
                 walk(
                     children,
                     sub_hidden,
-                    page,
+                    &mut child_page,
                     table_locations,
                     runner,
                     opts,
@@ -325,11 +456,30 @@ fn walk(
                 i += 1;
                 continue;
             }
+            Node::Table(table) if opts.target == OutputTarget::Doclang => {
+                if let Some(rows) = &mut table.cell_blocks {
+                    for cell in rows.iter_mut().flatten() {
+                        let mut child_page = effective_page;
+                        walk(
+                            cell,
+                            sub_hidden,
+                            &mut child_page,
+                            table_locations,
+                            runner,
+                            opts,
+                            stats,
+                        );
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
         }
         match replacement_for(
             &nodes[i],
             hidden,
-            *page,
+            effective_page,
             table_locations,
             runner,
             opts,
@@ -364,27 +514,50 @@ fn replacement_for(
     stats: &mut OcrStats,
 ) -> Option<Vec<Node>> {
     let (wraps, inner) = peel(node);
-    let Node::Picture { caption, image, .. } = inner else {
+    let Node::Picture {
+        caption,
+        caption_href,
+        image,
+        ..
+    } = inner
+    else {
         return None;
     };
     stats.pictures += 1;
     let img = image.as_ref()?;
-    let hidden_here = hidden || wraps.iter().any(|w| w.hidden());
-    if hidden_here && !opts.ocr_hidden {
+    let hidden_here = hidden || wraps.iter().any(|w| w.hidden(opts.target));
+    if hidden_here {
         return None;
     }
-    let picture_location = wraps.iter().find_map(|wrap| match wrap {
-        Wrap::Located(location) => Some(*location),
-        _ => None,
-    });
-    if picture_location.is_some_and(|picture| {
+    if location(&wraps).is_some_and(|(exact, picture)| {
         table_locations
-            .get(&page)
-            .is_some_and(|tables| tables.iter().any(|table| contains_table(picture, *table)))
+            .get(&(page, exact))
+            .is_some_and(|tables| tables.iter().any(|table| contains_box(picture, *table)))
     }) {
         stats.skipped_structured += 1;
         return None;
     }
+    let mut parts = ocr_parts(img, runner, opts, stats)?;
+    if !opts.keep_picture {
+        if let Some(caption) = caption.as_ref().filter(|c| !c.trim().is_empty()) {
+            parts.insert(
+                0,
+                Node::Caption {
+                    text: caption.clone(),
+                    href: caption_href.clone(),
+                },
+            );
+        }
+    }
+    Some(parts.into_iter().map(|n| rewrap(&wraps, n)).collect())
+}
+
+fn ocr_parts(
+    img: &docling_core::PictureImage,
+    runner: &mut OcrRunner,
+    opts: &PostOptions,
+    stats: &mut OcrStats,
+) -> Option<Vec<Node>> {
     let area = img.width.saturating_mul(img.height);
     if opts.min_pixels > 0 && area > 0 && area < opts.min_pixels {
         stats.skipped_small += 1;
@@ -400,34 +573,14 @@ fn replacement_for(
     let text = outcome.text.trim();
     if text.is_empty() {
         stats.empty += 1;
-        if opts.keep_picture {
-            // The image itself renders in embedded/referenced mode — keep it.
-            return None;
-        }
-        // No readable text: drop the picture — and with it the placeholder —
-        // keeping only its caption. A textless screenshot border or logo adds
-        // nothing to the text output. (OCR *failure* is different: there we
-        // don't know whether text exists, so the placeholder stays.)
-        let mut parts = Vec::new();
-        if let Some(c) = caption {
-            if !c.trim().is_empty() {
-                parts.push(Node::Paragraph { text: c.clone() });
-            }
-        }
-        return Some(parts.into_iter().map(|n| rewrap(&wraps, n)).collect());
+        return if opts.keep_picture {
+            None
+        } else {
+            Some(Vec::new())
+        };
     }
     stats.ocred += 1;
-
-    let mut parts: Vec<Node> = Vec::new();
-    // Dropping the Picture node would drop its caption with it — re-emit the
-    // caption first, exactly where the serializer would have printed it.
-    if !opts.keep_picture {
-        if let Some(c) = caption {
-            if !c.trim().is_empty() {
-                parts.push(Node::Paragraph { text: c.clone() });
-            }
-        }
-    }
+    let mut parts = Vec::new();
     match opts.mode {
         OutputMode::Fence => {
             let body = match outcome.grid.as_deref().map(str::trim_end) {
@@ -473,25 +626,25 @@ fn replacement_for(
         // Callers skip apply() entirely in Placeholder mode.
         OutputMode::Placeholder => return None,
     }
-    Some(parts.into_iter().map(|n| rewrap(&wraps, n)).collect())
+    Some(parts)
 }
 
 /// True when at least 80% of the structured table lies inside the picture.
+#[cfg(test)]
 fn contains_table(picture: [u16; 4], table: [u16; 4]) -> bool {
-    let [px0, py0, px1, py1] = picture;
-    let [tx0, ty0, tx1, ty1] = table;
-    let table_width = tx1.saturating_sub(tx0) as u64;
-    let table_height = ty1.saturating_sub(ty0) as u64;
-    let table_area = table_width.saturating_mul(table_height);
-    if table_area == 0 {
+    contains_box(picture.map(f64::from), table.map(f64::from))
+}
+
+fn contains_box(picture: [f64; 4], table: [f64; 4]) -> bool {
+    if !picture.iter().chain(table.iter()).all(|n| n.is_finite()) {
         return false;
     }
-    let ix0 = px0.max(tx0);
-    let iy0 = py0.max(ty0);
-    let ix1 = px1.min(tx1);
-    let iy1 = py1.min(ty1);
-    let intersection = ix1.saturating_sub(ix0) as u64 * iy1.saturating_sub(iy0) as u64;
-    intersection.saturating_mul(100) >= table_area.saturating_mul(80)
+    let [px0, py0, px1, py1] = picture;
+    let [tx0, ty0, tx1, ty1] = table;
+    let area = (tx1 - tx0).abs() * (ty1 - ty0).abs();
+    let width = (px0.max(px1).min(tx0.max(tx1)) - px0.min(px1).max(tx0.min(tx1))).max(0.0);
+    let height = (py0.max(py1).min(ty0.max(ty1)) - py0.min(py1).max(ty0.min(ty1))).max(0.0);
+    area > 0.0 && width * height >= 0.8 * area
 }
 
 #[cfg(test)]
@@ -512,6 +665,8 @@ mod tests {
                 data: vec![1, 2, 3, w as u8, h as u8],
             }),
             classification: None,
+            caption_href: None,
+            caption_parent: Default::default(),
         }
     }
 
@@ -523,6 +678,8 @@ mod tests {
             compact_tables: false,
             links: Vec::new(),
             confidence: None,
+            page_break_placeholder: None,
+            tree: None,
         }
     }
 
@@ -536,7 +693,7 @@ mod tests {
             mode,
             min_pixels: 0,
             keep_picture: false,
-            ocr_hidden: false,
+            target: OutputTarget::Markdown,
         }
     }
 
@@ -594,7 +751,7 @@ mod tests {
             !md.contains("<!-- image -->"),
             "placeholder replaced: {md:?}"
         );
-        let expected = "before\n\n<!-- ocr:begin engine=mock -->\n\nline one\nline two\n\n<!-- ocr:end -->\n\nafter";
+        let expected = "before\n\n<!-- ocr:begin engine=mock -->\n\nline one  \nline two\n\n<!-- ocr:end -->\n\nafter";
         assert!(md.contains(expected), "markers block: {md:?}");
     }
 
@@ -615,7 +772,7 @@ mod tests {
         let mut r = runner(vec![Ok("Invoice #1\n\nTotal: $5".into())]);
         apply(&mut d, &mut r, &opts(OutputMode::Quote));
         let md = d.export_to_markdown();
-        assert!(md.contains("> Invoice #1\n>\n> Total: $5"), "{md:?}");
+        assert!(md.contains("> Invoice #1  \n>  \n> Total: $5"), "{md:?}");
     }
 
     #[test]
@@ -661,6 +818,8 @@ mod tests {
                 data: vec![7],
             }),
             classification: None,
+            caption_href: None,
+            caption_parent: Default::default(),
         }]);
         let mut r = runner(vec![Ok(String::new())]);
         apply(&mut d, &mut r, &opts(OutputMode::Markers));
@@ -692,6 +851,8 @@ mod tests {
             caption: None,
             image: None,
             classification: None,
+            caption_href: None,
+            caption_parent: Default::default(),
         }]);
         let mut r = runner(vec![]);
         let stats = apply(&mut d, &mut r, &opts(OutputMode::Markers));
@@ -726,6 +887,8 @@ mod tests {
                 data: vec![9],
             }),
             classification: None,
+            caption_href: None,
+            caption_parent: Default::default(),
         }]);
         let mut r = runner(vec![Ok("bars".into())]);
         apply(&mut d, &mut r, &opts(OutputMode::Text));
@@ -756,12 +919,78 @@ mod tests {
     fn group_children_are_walked() {
         let mut d = doc(vec![Node::Group {
             label: "section".into(),
+            name: None,
+            layer: None,
             children: vec![picture(100, 100)],
         }]);
         let mut r = runner(vec![Ok("grouped".into())]);
         let stats = apply(&mut d, &mut r, &opts(OutputMode::Text));
         assert_eq!(stats.ocred, 1);
         assert!(d.export_to_markdown().contains("grouped"));
+    }
+
+    #[test]
+    fn hidden_tables_do_not_suppress_visible_picture_ocr() {
+        let table = Node::Located {
+            location: [10, 10, 90, 90],
+            inner: Box::new(Node::Table(docling_core::Table {
+                rows: vec![vec!["hidden table".into()]],
+                ..Default::default()
+            })),
+        };
+        let mut d = doc(vec![
+            Node::DoclangOnly(Box::new(table)),
+            Node::Located {
+                location: [0, 0, 100, 100],
+                inner: Box::new(picture(100, 100)),
+            },
+        ]);
+        let mut r = runner(vec![Ok("visible".into())]);
+        let stats = apply(&mut d, &mut r, &opts(OutputMode::Text));
+        assert_eq!(stats.skipped_structured, 0);
+        assert_eq!(stats.ocred, 1);
+        assert!(d.export_to_markdown().contains("visible"));
+    }
+
+    #[test]
+    fn rich_cells_are_walked_for_doclang_and_wrappers_survive() {
+        let cell = Node::Commented {
+            comments: vec![7],
+            inner: Box::new(Node::Prov {
+                page_no: 2,
+                bbox: [1., 2., 30., 40.],
+                charspan: [0, 0],
+                seq: Some(3),
+                inner: Box::new(picture(100, 100)),
+            }),
+        };
+        let mut d = doc(vec![Node::Table(docling_core::Table {
+            rows: vec![vec![String::new()]],
+            cell_blocks: Some(vec![vec![vec![cell]]]),
+            ..Default::default()
+        })]);
+        let mut r = runner(vec![Ok("Čitljiv tekst".into())]);
+        assert_eq!(apply(&mut d, &mut r, &opts(OutputMode::Text)).ocred, 0);
+        let mut options = opts(OutputMode::Text);
+        options.target = OutputTarget::Doclang;
+        assert_eq!(apply(&mut d, &mut r, &options).ocred, 1);
+        let Node::Table(table) = &d.nodes[0] else {
+            panic!("table")
+        };
+        let Node::Commented { comments, inner } = &table.cell_blocks.as_ref().unwrap()[0][0][0]
+        else {
+            panic!("comments")
+        };
+        assert_eq!(comments, &[7]);
+        assert!(matches!(
+            inner.as_ref(),
+            Node::Prov {
+                page_no: 2,
+                charspan: [0, 13],
+                seq: Some(3),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -785,7 +1014,7 @@ mod tests {
         let mut d = doc(vec![furniture_pic()]);
         let mut r = runner(vec![Ok("header".into())]);
         let mut o = opts(OutputMode::Text);
-        o.ocr_hidden = true;
+        o.target = OutputTarget::Doclang;
         let stats = apply(&mut d, &mut r, &o);
         assert_eq!(stats.ocred, 1);
         assert!(matches!(&d.nodes[0], Node::Furniture { .. }));
@@ -831,13 +1060,10 @@ mod tests {
     #[test]
     fn upstream_rtf_picture_reaches_picture_ocr() {
         let png_hex = "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082";
-        let rtf = format!(r"{{\rtf1\ansi{{\pict\pngblip\picw100\pich100 {png_hex}}}\par}}")
-            .into_bytes();
-        let source = docling::SourceDocument::from_bytes(
-            "picture.rtf",
-            docling::InputFormat::Rtf,
-            rtf,
-        );
+        let rtf =
+            format!(r"{{\rtf1\ansi{{\pict\pngblip\picw100\pich100 {png_hex}}}\par}}").into_bytes();
+        let source =
+            docling::SourceDocument::from_bytes("picture.rtf", docling::InputFormat::Rtf, rtf);
         let mut document = docling::DocumentConverter::new()
             .convert(source)
             .unwrap()
@@ -858,6 +1084,7 @@ mod tests {
             structure: None,
             cell_blocks: None,
             caption: None,
+            ..Default::default()
         };
         let mut d = doc(vec![
             Node::PageInfo {

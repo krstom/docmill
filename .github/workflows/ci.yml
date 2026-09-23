@@ -17,6 +17,7 @@ jobs:
         with:
           repository: docling-project/docling.rs
           path: docling.rs
+          ref: 8f665b094c1ac2a5ff6d6d6f0a84e1939476c23b
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,10 +28,13 @@ jobs:
       # real hosts and by the platform checks below.
       - name: Test (no default features)
         working-directory: docmill
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
+      - name: Test (HTTP service)
+        working-directory: docmill
+        run: cargo test --locked --no-default-features --features serve
       - name: Check (default features compile)
         working-directory: docmill
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
   platform-check:
     strategy:
@@ -46,13 +50,17 @@ jobs:
         with:
           repository: docling-project/docling.rs
           path: docling.rs
+          ref: 8f665b094c1ac2a5ff6d6d6f0a84e1939476c23b
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: docmill
       - name: Test (no default features)
         working-directory: docmill
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
+      - name: Test (HTTP service)
+        working-directory: docmill
+        run: cargo test --locked --no-default-features --features serve
       - name: Check (default features compile)
         working-directory: docmill
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
